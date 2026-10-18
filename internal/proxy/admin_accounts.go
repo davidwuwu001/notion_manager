@@ -12,20 +12,21 @@ import (
 //
 // JSON tags use snake_case to match the rest of the admin API.
 type AccountSummary struct {
-	ExhaustedOnly       int   `json:"exhausted_only"`
-	NoWorkspace         int   `json:"no_workspace"`
-	PremiumAccounts     int   `json:"premium_accounts"`
-	ResearchLimited     int   `json:"research_limited"`
-	TotalResearchUsage  int   `json:"total_research_usage"`
-	TotalRemaining      int   `json:"total_remaining"`
-	TotalSpaceUsage     int   `json:"total_space_usage"`
-	TotalSpaceLimit     int   `json:"total_space_limit"`
-	TotalSpaceRemaining int   `json:"total_space_remaining"`
-	TotalUserUsage      int   `json:"total_user_usage"`
-	TotalUserLimit      int   `json:"total_user_limit"`
-	TotalUserRemaining  int   `json:"total_user_remaining"`
-	TotalPremiumBalance int64 `json:"total_premium_balance"`
-	TotalPremiumLimit   int64 `json:"total_premium_limit"`
+	ExhaustedOnly          int   `json:"exhausted_only"`
+	NoWorkspace            int   `json:"no_workspace"`
+	PremiumAccounts        int   `json:"premium_accounts"`
+	ResearchLimited        int   `json:"research_limited"`
+	TotalResearchUsage     int   `json:"total_research_usage"`
+	TotalRemaining         int   `json:"total_remaining"`
+	TotalSpaceUsage        int   `json:"total_space_usage"`
+	TotalSpaceLimit        int   `json:"total_space_limit"`
+	TotalSpaceRemaining    int   `json:"total_space_remaining"`
+	TotalUserUsage         int   `json:"total_user_usage"`
+	TotalUserLimit         int   `json:"total_user_limit"`
+	TotalUserRemaining     int   `json:"total_user_remaining"`
+	TotalPremiumBalance    int64 `json:"total_premium_balance"`
+	TotalPremiumLimit      int64 `json:"total_premium_limit"`
+	PremiumUnknownAccounts int   `json:"premium_unknown_accounts"`
 }
 
 // summarizeAccounts walks the full account-detail list and produces the
@@ -57,7 +58,11 @@ func summarizeAccounts(accounts []map[string]interface{}) AccountSummary {
 		s.TotalUserUsage += mapInt(a, "user_usage")
 		s.TotalUserLimit += mapInt(a, "user_limit")
 		s.TotalUserRemaining += mapInt(a, "user_remaining")
-		s.TotalPremiumBalance += int64(mapInt(a, "premium_balance"))
+		if mapBool(a, "premium_balance_known") {
+			s.TotalPremiumBalance += int64(mapInt(a, "premium_balance"))
+		} else {
+			s.PremiumUnknownAccounts++
+		}
 		s.TotalPremiumLimit += int64(mapInt(a, "premium_limit"))
 	}
 	return s

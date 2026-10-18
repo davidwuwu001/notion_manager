@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"notion-manager/internal/proxy"
@@ -42,9 +46,10 @@ func indexedSecretName(base string, index int) string {
 
 func accountDiscoveryOptionsFromEnvironmentAt(index int) proxy.AccountDiscoveryOptions {
 	return proxy.AccountDiscoveryOptions{
-		ActiveUserID:  strings.TrimSpace(os.Getenv(indexedSecretName("NOTION_ACTIVE_USER_ID", index))),
-		SpaceID:       strings.TrimSpace(os.Getenv(indexedSecretName("NOTION_SPACE_ID", index))),
-		ExpectedEmail: strings.TrimSpace(os.Getenv(indexedSecretName("NOTION_EXPECTED_EMAIL", index))),
+		RequireBusiness: true,
+		ActiveUserID:    strings.TrimSpace(os.Getenv(indexedSecretName("NOTION_ACTIVE_USER_ID", index))),
+		SpaceID:         strings.TrimSpace(os.Getenv(indexedSecretName("NOTION_SPACE_ID", index))),
+		ExpectedEmail:   strings.TrimSpace(os.Getenv(indexedSecretName("NOTION_EXPECTED_EMAIL", index))),
 	}
 }
 
@@ -186,8 +191,12 @@ func apiKeyAuthMiddleware(apiKey string, next http.Handler) http.Handler {
 	})
 }
 
-func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth *proxy.DashboardAuth, usageStats *proxy.UsageStats, regDeps *proxy.RegisterJobsDeps) *http.ServeMux {
+func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth *proxy.DashboardAuth, usageStats *proxy.UsageStats, regDeps *proxy.RegisterJobsDeps, stores ...*proxy.RequestLogStore) *http.ServeMux {
 	mux := http.NewServeMux()
+	var requestLogs *proxy.RequestLogStore
+	if len(stores) > 0 {
+		requestLogs = stores[0]
+	}
 
 	// Anthropic + OpenAI-compatible API endpoints
 	mux.HandleFunc("/v1/messages", proxy.HandleAnthropicMessages(pool))
@@ -207,12 +216,25 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	mux.HandleFunc("/admin/refresh", proxy.HandleAdminRefresh(pool, accountsDir, dashAuth))
 	mux.HandleFunc("/admin/settings", proxy.HandleAdminSettings("config.yaml", dashAuth))
 	mux.HandleFunc("/admin/stats", proxy.HandleAdminStats(usageStats, dashAuth))
+	mux.HandleFunc("/admin/connection", dashAuth.HandleConnection())
+	mux.HandleFunc("/admin/request-logs", proxy.HandleRequestLogs(requestLogs, dashAuth))
+	mux.HandleFunc("/admin/request-logs/", proxy.HandleRequestLogDetail(requestLogs, dashAuth))
+	mux.HandleFunc("/admin/analytics", proxy.HandleAnalytics(requestLogs, dashAuth))
+	routingHandler := proxy.HandleAdminRouting(pool, dashAuth)
+	mux.HandleFunc("/admin/routing", func(w http.ResponseWriter, r *http.Request) {
+		routingHandler(w, r)
+		if requestLogs != nil {
+			if err := requestLogs.SetRetentionDays(pool.RoutingSnapshot().RetentionDays); err != nil {
+				log.Printf("[request-logs] retention update failed")
+			}
+		}
+	})
 
 	// Bulk Microsoft-SSO registration. The legacy synchronous endpoint is
 	// kept for parity with the dashboard's older "submit + wait" UI; the
 	// async Job-based endpoints power the new register drawer (with SSE
 	// progress at /admin/register/jobs/{id}/events).
-	mux.HandleFunc("/admin/register", proxy.HandleAdminRegister(pool, accountsDir, dashAuth))
+	mux.HandleFunc("/admin/register", proxy.HandleAdminRegister(pool, accountsDir, dashAuth, true))
 	mux.HandleFunc("/admin/register/providers", proxy.HandleAdminRegisterProviders(regDeps))
 	mux.HandleFunc("/admin/register/start", proxy.HandleAdminRegisterStart(regDeps))
 	mux.HandleFunc("/admin/register/jobs", proxy.HandleAdminRegisterJobsList(regDeps))
@@ -270,6 +292,9 @@ func main() {
 	tokenFile := cfg.Server.TokenFile
 
 	pool := proxy.NewAccountPool()
+	if err := pool.ConfigureRouting(filepath.Join(accountsDir, ".routing.json")); err != nil {
+		log.Fatalf("[routing] %v", err)
+	}
 	discoveryConfigured := accountDiscoveryConfigured()
 	if err := loadStartupAccounts(pool, accountsDir, tokenFile); err != nil {
 		if discoveryConfigured {
@@ -295,7 +320,13 @@ func main() {
 	// share a backup target with .register_history.json.
 	statsPath := filepath.Join(accountsDir, ".token_stats.json")
 	usageStats := proxy.InitUsageStats(statsPath)
-	usageStats.StartFlushLoop(5 * time.Second)
+	stopStats := usageStats.StartFlushLoop(5 * time.Second)
+	defer stopStats()
+	requestLogs, err := proxy.NewRequestLogStore(filepath.Join(accountsDir, ".request_logs.sqlite"), pool.RoutingSnapshot().RetentionDays)
+	if err != nil {
+		log.Fatalf("[request-logs] cannot initialize storage: %v", err)
+	}
+	defer requestLogs.Close()
 
 	// Async batch-register store + provider registry.
 	regStore, err := regjob.NewStore(cfg.Register.HistoryFile, cfg.Register.HistoryMemoryCap)
@@ -309,11 +340,12 @@ func main() {
 	dashAuth := proxy.NewDashboardAuth(cfg.Server.AdminPassword, apiKey)
 
 	regDeps := &proxy.RegisterJobsDeps{
-		Pool:        pool,
-		AccountsDir: accountsDir,
-		Store:       regStore,
-		Providers:   registry,
-		Auth:        dashAuth,
+		Pool:         pool,
+		AccountsDir:  accountsDir,
+		Store:        regStore,
+		Providers:    registry,
+		Auth:         dashAuth,
+		BusinessOnly: true,
 	}
 
 	cors := func(next http.Handler) http.Handler {
@@ -329,12 +361,12 @@ func main() {
 		})
 	}
 
-	mux := newMux(pool, accountsDir, apiKey, dashAuth, usageStats, regDeps)
+	mux := newMux(pool, accountsDir, apiKey, dashAuth, usageStats, regDeps, requestLogs)
 
 	log.Printf("=== notion-manager ===")
 	log.Printf("Listening on 127.0.0.1:%s", port)
 	log.Printf("Accounts: %d", pool.Count())
-	log.Printf("API Key: %s", apiKey)
+	log.Printf("API Key: configured (hidden)")
 	log.Printf("Dashboard: password protected")
 	log.Printf("Endpoints:")
 	log.Printf("  GET  /dashboard/                  (Dashboard UI)")
@@ -354,7 +386,22 @@ func main() {
 	log.Printf("  GET  /admin/register/jobs/{id}/events (SSE progress)")
 	log.Printf("  GET  /ai                          (Reverse Proxy -> notion.so)")
 
-	if err := http.ListenAndServe("127.0.0.1:"+port, cors(apiKeyAuthMiddleware(apiKey, mux))); err != nil {
-		log.Fatalf("Server error: %v", err)
+	server := &http.Server{Addr: "127.0.0.1:" + port, Handler: cors(proxy.RequestLogMiddleware(requestLogs, apiKeyAuthMiddleware(apiKey, mux))), ReadHeaderTimeout: 10 * time.Second}
+	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-stopCtx.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			_ = server.Close()
+		}
+	}()
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("Server error: %v", err)
 	}
+	stop()
+	<-shutdownDone
 }

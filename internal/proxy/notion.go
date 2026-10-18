@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -175,7 +176,7 @@ func buildWebSearchCallOptions(requestID string, reasoningEffort string) CallOpt
 // executeWebSearch runs a web search query via Notion's native search capability.
 // It makes a separate CallInference call with useWebSearch=true and no tool framing,
 // allowing Notion's model to use its built-in search tool (two-turn inference).
-func executeWebSearch(acc *Account, query string, model string, requestID string, reasoningEffort string) (string, *UsageInfo, error) {
+func executeWebSearch(acc *Account, query string, model string, requestID string, reasoningEffort string, contexts ...context.Context) (string, *UsageInfo, error) {
 	var result strings.Builder
 	var finalUsage *UsageInfo
 	var knownCitationURLs []string
@@ -187,11 +188,14 @@ func executeWebSearch(acc *Account, query string, model string, requestID string
 	}
 
 	callOpts := buildWebSearchCallOptions(requestID, reasoningEffort)
+	if len(contexts) > 0 {
+		callOpts.Context = contexts[0]
+	}
 	callOpts.KnownCitationURLs = &knownCitationURLs
 	callOpts.KnownCitationDocs = &knownCitationDocs
 	callOpts.KnownToolCallURLs = &knownToolCallURLs
 
-	err := CallInference(acc, messages, model, false, func(delta string, done bool, usage *UsageInfo) {
+	err := inferenceCaller(acc, messages, model, false, func(delta string, done bool, usage *UsageInfo) {
 		if delta != "" {
 			result.WriteString(delta)
 		}
@@ -1298,6 +1302,45 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
+	if opt.Context == nil {
+		opt.Context = context.Background()
+	}
+	var finalUsage *UsageInfo
+	originalCallback := cb
+	cb = func(delta string, done bool, usage *UsageInfo) {
+		if usage != nil {
+			snapshot := *usage
+			finalUsage = &snapshot
+		}
+		originalCallback(delta, done, usage)
+	}
+	defer func() {
+		attempt := RequestAttemptFromContext(opt.Context)
+		source := "actual"
+		if opt.IsResearcher || IsResearcherModel(model) {
+			source = "estimated"
+		}
+		usage := RequestUsage{Source: "unknown", Completeness: "unknown"}
+		if finalUsage != nil {
+			input, output := int64(finalUsage.PromptTokens), int64(finalUsage.CompletionTokens)
+			usage = RequestUsage{Source: source, Completeness: "unknown"}
+			if finalUsage.InputKnown || source == "estimated" {
+				usage.InputTokens = &input
+				usage.Completeness = "partial"
+			}
+			if finalUsage.OutputKnown || source == "estimated" {
+				usage.OutputTokens = &output
+				usage.Completeness = "partial"
+			}
+			if usage.InputTokens != nil && usage.OutputTokens != nil {
+				usage.Completeness = "complete"
+			}
+			if usage.InputTokens == nil && usage.OutputTokens == nil {
+				usage.Source = "unknown"
+			}
+		}
+		attempt.RecordUsage(usage)
+	}()
 	requestID := opt.RequestID
 	reasoningEffort, err := normalizeReasoningEffort(opt.ReasoningEffort)
 	if err != nil {
@@ -1420,7 +1463,7 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 	}
 	LogNotionRequestJSON(requestID, fmt.Sprintf("POST /runInferenceTranscript account=%s model=%s", acc.UserEmail, notionModel), reqBody)
 
-	req, err := http.NewRequest("POST", NotionAPIBase+"/runInferenceTranscript", bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(opt.Context, "POST", NotionAPIBase+"/runInferenceTranscript", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -1442,7 +1485,7 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
 		LogNotionResponseText(requestID, "POST /runInferenceTranscript error body", string(body))
-		return fmt.Errorf("notion API error %d: %s", resp.StatusCode, string(body[:min(len(body), 500)]))
+		return &notionHTTPError{Status: resp.StatusCode, RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 
 	// Decompress
@@ -1903,16 +1946,17 @@ func CheckQuota(acc *Account) (*QuotaInfo, error) {
 		return nil, fmt.Errorf("parse V2 response: %w", err)
 	}
 
-	monthlyUsage := v2.PremiumCredits.PerSource.MonthlyAllocated.UsageTotal
-	monthlyLimit := v2.PremiumCredits.PerSource.MonthlyAllocated.Limit
-	premiumRemaining := v2.PremiumCredits.TotalCreditBalance
-	// Some workspaces report remaining premium via monthlyAllocated usage/limit,
-	// while totalCreditBalance can stay at 0.
-	if premiumRemaining <= 0 && monthlyLimit > monthlyUsage {
-		premiumRemaining = monthlyLimit - monthlyUsage
+	info := mergeQuotaResponses(v1, v2)
+	info.RateLimit, err = checkCreditRateLimit(acc, client)
+	if err != nil {
+		info.RateLimitError = "AI usage unavailable"
+		log.Printf("[quota] credit rate limit unavailable: %v", err)
 	}
+	info.QuotaStatusReason = quotaStatusReason(info)
+	return info, nil
+}
 
-	// Merge V1 + V2 into QuotaInfo
+func mergeQuotaResponses(v1 quotaV1Response, v2 quotaV2Response) *QuotaInfo {
 	info := &QuotaInfo{
 		IsEligible:        v1.IsEligible,
 		SpaceUsage:        v1.SpaceUsage,
@@ -1922,21 +1966,27 @@ func CheckQuota(acc *Account) (*QuotaInfo, error) {
 		LastUsageAtMs:     v1.LastSpaceUsageAtMs,
 		ResearchModeUsage: v1.ResearchModeUsage,
 		// Premium credits from V2
-		PremiumBalance: premiumRemaining,
-		PremiumUsage:   monthlyUsage,
-		PremiumLimit:   monthlyLimit,
+		PremiumBalanceKnown: v2.PremiumCredits.TotalCreditBalance != nil,
+		PremiumUsage:   v2.PremiumCredits.PerSource.MonthlyAllocated.UsageTotal,
+		PremiumLimit:   v2.PremiumCredits.PerSource.MonthlyAllocated.Limit,
 	}
+	if v2.PremiumCredits.TotalCreditBalance != nil { info.PremiumBalance = *v2.PremiumCredits.TotalCreditBalance }
 	info.HasPremium = info.PremiumLimit > 0 ||
 		v2.PremiumCredits.PerSource.MonthlyCommitted.Limit > 0 ||
 		v2.PremiumCredits.PerSource.YearlyElastic.Limit > 0 ||
-		info.PremiumBalance > 0
-	info.RateLimit, err = checkCreditRateLimit(acc, client)
-	if err != nil {
-		info.RateLimitError = "AI usage unavailable"
-		log.Printf("[quota] credit rate limit unavailable: %v", err)
-	}
+		(info.PremiumBalanceKnown && info.PremiumBalance > 0)
+	info.QuotaStatusReason = quotaStatusReason(info)
+	return info
+}
 
-	return info, nil
+func quotaStatusReason(info *QuotaInfo) string {
+	if !info.IsEligible && info.RateLimit != nil {
+		blocked, _ := routingAllowanceBlocked(info)
+		if !blocked && (info.RateLimit.Window.Limit > 0 || info.RateLimit.BillingPeriodWindow.Limit > 0) { return "eligibility_conflict" }
+	}
+	if !info.PremiumBalanceKnown { return "premium_balance_unknown" }
+	if info.PremiumBalance == 0 && info.PremiumLimit > info.PremiumUsage { return "premium_balance_conflict" }
+	return ""
 }
 
 func checkCreditRateLimit(acc *Account, client *http.Client) (*CreditRateLimit, error) {
@@ -2477,6 +2527,27 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 
 	// Accumulated usage across multi-turn inference (e.g., web search creates 2 turns)
 	var totalUsage UsageInfo
+	usageByStep := make(map[string]UsageInfo)
+	updateUsage := func(key string, input, output *int) {
+		usage := usageByStep[key]
+		if input != nil {
+			usage.PromptTokens = *input
+			usage.InputKnown = true
+		}
+		if output != nil {
+			usage.CompletionTokens = *output
+			usage.OutputKnown = true
+		}
+		usageByStep[key] = usage
+		totalUsage = UsageInfo{InputKnown: true, OutputKnown: true}
+		for _, snapshot := range usageByStep {
+			totalUsage.PromptTokens += snapshot.PromptTokens
+			totalUsage.CompletionTokens += snapshot.CompletionTokens
+			totalUsage.InputKnown = totalUsage.InputKnown && snapshot.InputKnown
+			totalUsage.OutputKnown = totalUsage.OutputKnown && snapshot.OutputKnown
+		}
+		totalUsage.TotalTokens = totalUsage.PromptTokens + totalUsage.CompletionTokens
+	}
 
 	// Track which patch value indices are thinking vs text vs tool_use
 	// Key: "/s/N/value/M" → entry type ("thinking", "text", "tool_use")
@@ -2833,11 +2904,7 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 				// Final emit to flush any remaining text
 				emitDelta()
 				// Accumulate token usage across turns
-				if step.InputTokens != nil && step.OutputTokens != nil {
-					totalUsage.PromptTokens += *step.InputTokens
-					totalUsage.CompletionTokens += *step.OutputTokens
-					totalUsage.TotalTokens = totalUsage.PromptTokens + totalUsage.CompletionTokens
-				}
+				updateUsage("agent:"+step.ID, step.InputTokens, step.OutputTokens)
 				cb("", true, &totalUsage)
 			}
 
@@ -2906,18 +2973,17 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 				}
 
 				// Handle token usage in patch format
-				if op.O == "a" && strings.HasSuffix(op.P, "/inputTokens") {
+				if (op.O == "a" || op.O == "r") && strings.HasSuffix(op.P, "/inputTokens") {
 					var tokens int
 					if json.Unmarshal(op.V, &tokens) == nil {
-						totalUsage.PromptTokens += tokens
+						updateUsage("patch:"+strings.TrimSuffix(op.P, "/inputTokens"), &tokens, nil)
 					}
 					continue
 				}
-				if op.O == "a" && strings.HasSuffix(op.P, "/outputTokens") {
+				if (op.O == "a" || op.O == "r") && strings.HasSuffix(op.P, "/outputTokens") {
 					var tokens int
 					if json.Unmarshal(op.V, &tokens) == nil {
-						totalUsage.CompletionTokens += tokens
-						totalUsage.TotalTokens = totalUsage.PromptTokens + totalUsage.CompletionTokens
+						updateUsage("patch:"+strings.TrimSuffix(op.P, "/outputTokens"), nil, &tokens)
 						cb("", true, &totalUsage)
 					}
 					continue
@@ -3398,7 +3464,7 @@ func callResearcherInference(acc *Account, messages []ChatMessage, cb StreamCall
 	}
 	LogNotionRequestJSON(requestID, fmt.Sprintf("POST /runInferenceTranscript researcher account=%s", acc.UserEmail), reqBody)
 
-	req, err := http.NewRequest("POST", NotionAPIBase+"/runInferenceTranscript", bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(opt.Context, "POST", NotionAPIBase+"/runInferenceTranscript", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return fmt.Errorf("create researcher request: %w", err)
 	}
@@ -3420,7 +3486,7 @@ func callResearcherInference(acc *Account, messages []ChatMessage, cb StreamCall
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
 		LogNotionResponseText(requestID, "POST /runInferenceTranscript researcher error body", string(body))
-		return fmt.Errorf("notion researcher API error %d: %s", resp.StatusCode, string(body[:min(len(body), 500)]))
+		return &notionHTTPError{Status: resp.StatusCode, RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 
 	reader, cleanup, err := decompressBody(resp)

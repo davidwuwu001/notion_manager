@@ -756,6 +756,9 @@ func TestRetryJobNoFailuresReturns400(t *testing.T) {
 // Notion server, then polls the account file for quota_info to land
 // (the refresh runs in a background goroutine after the runner finishes).
 func TestStartRegisterTriggersPostRegisterRefreshAndPersists(t *testing.T) {
+	originalBusinessCheck := businessSubscriptionChecker
+	businessSubscriptionChecker = func(*Account) error { return nil }
+	t.Cleanup(func() { businessSubscriptionChecker = originalBusinessCheck })
 	h := newRegHandlerHarness(t)
 
 	var fetcherHits atomic.Int32

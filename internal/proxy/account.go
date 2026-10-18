@@ -22,11 +22,19 @@ import (
 // transport pinned to www.notion.so, which can't be repointed at httptest
 // URLs).
 var (
-	quotaFetcher    = CheckQuota
-	modelsFetcher   = FetchModels
-	workspaceProbe  = CheckUserWorkspace
-	accountChmod    = os.Chmod
-	accountReadFile = os.ReadFile
+	quotaFetcher                = CheckQuota
+	modelsFetcher               = FetchModels
+	workspaceProbe              = CheckUserWorkspace
+	accountChmod                = os.Chmod
+	accountReadFile             = os.ReadFile
+	accountSaveMu               sync.Mutex
+	singleAccountDiscoverer     = DiscoverAccountFromToken
+	businessSubscriptionChecker = func(acc *Account) error {
+		if AppConfig == nil {
+			return fmt.Errorf("subscription configuration unavailable")
+		}
+		return requireBusinessSubscription(acc)
+	}
 )
 
 const (
@@ -100,9 +108,13 @@ func writePrivateAccountFile(path string, data []byte) (err error) {
 }
 
 type AccountPool struct {
-	mu       sync.RWMutex
-	accounts []*Account
-	index    atomic.Uint64
+	mu            sync.RWMutex
+	accounts      []*Account
+	index         atomic.Uint64
+	routingMu     sync.Mutex
+	routingConfig RoutingConfig
+	routingPath   string
+	routingStates map[string]*routingRuntime
 
 	// Refresh state (protected by refreshMu)
 	refreshMu      sync.RWMutex
@@ -155,6 +167,10 @@ func cloneQuotaInfo(src *QuotaInfo) *QuotaInfo {
 		return nil
 	}
 	dst := *src
+	if src.RateLimit != nil {
+		limit := *src.RateLimit
+		dst.RateLimit = &limit
+	}
 	return &dst
 }
 
@@ -315,11 +331,9 @@ func (p *AccountPool) LoadFromDir(dir string) error {
 // registration so newly-created files become live without a server
 // restart.
 func (p *AccountPool) ReloadFromDir(dir string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	known := make(map[string]bool, len(p.accounts))
-	for _, acc := range p.accounts {
+	accounts := p.AccountsSnapshot()
+	known := make(map[string]bool, len(accounts))
+	for _, acc := range accounts {
 		acc.EnsureAccountID()
 		if acc.AccountID != "" {
 			known[acc.AccountID] = true
@@ -361,7 +375,25 @@ func (p *AccountPool) ReloadFromDir(dir string) {
 		}
 		acc.QuotaInfo = loadPersistedQuotaInfo(data)
 		loadPersistedWorkspace(data, &acc)
+		if err := businessSubscriptionChecker(&acc); err != nil {
+			log.Printf("[account] reload skip %s: formal Business subscription not verified", entry.Name())
+			continue
+		}
+		acc.PlanType = "business"
+		p.mu.Lock()
+		duplicate := false
+		for _, existing := range p.accounts {
+			if existing.AccountID == acc.AccountID {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			p.mu.Unlock()
+			continue
+		}
 		p.accounts = append(p.accounts, &acc)
+		p.mu.Unlock()
 		if acc.AccountID != "" {
 			known[acc.AccountID] = true
 		}
@@ -369,7 +401,7 @@ func (p *AccountPool) ReloadFromDir(dir string) {
 		log.Printf("[account] reload added: %s (%s)", acc.UserName, acc.UserEmail)
 	}
 	if added > 0 {
-		log.Printf("[account] reload: %d new account(s); pool now has %d", added, len(p.accounts))
+		log.Printf("[account] reload: %d new account(s); pool now has %d", added, p.Count())
 	}
 }
 
@@ -379,19 +411,18 @@ func (p *AccountPool) LoadSingle(tokenFile string) error {
 		return fmt.Errorf("secure token file: %w", err)
 	}
 
-	var acc Account
-	if err := json.Unmarshal(data, &acc); err != nil {
-		// Treat as plain token file
-		acc = Account{
-			TokenV2:       string(data),
-			UserID:        "322d872b-594c-816e-b8ce-00022c725bb3",
-			SpaceID:       "176faced-55bd-8161-bbbf-000339934d27",
-			UserName:      "default",
-			SpaceName:     "default",
-			Timezone:      "UTC",
-			ClientVersion: DefaultClientVersion,
-			BrowserID:     generateUUIDv4(),
+	acc := &Account{}
+	if err := json.Unmarshal(data, acc); err != nil {
+		if strings.HasPrefix(strings.TrimSpace(string(data)), "{") {
+			return fmt.Errorf("invalid token-file account JSON")
 		}
+		acc, err = singleAccountDiscoverer(strings.TrimSpace(string(data)))
+		if err != nil {
+			return fmt.Errorf("discover token-file account: %w", err)
+		}
+	}
+	if acc == nil || acc.TokenV2 == "" || acc.UserID == "" || acc.SpaceID == "" {
+		return fmt.Errorf("token-file account has an incomplete identity")
 	}
 	if acc.BrowserID == "" {
 		acc.BrowserID = generateUUIDv4()
@@ -400,7 +431,11 @@ func (p *AccountPool) LoadSingle(tokenFile string) error {
 		acc.ClientVersion = DefaultClientVersion
 	}
 	acc.EnsureAccountID()
-	p.accounts = append(p.accounts, &acc)
+	if err := businessSubscriptionChecker(acc); err != nil {
+		return fmt.Errorf("token-file account requires formal Business: %w", err)
+	}
+	acc.PlanType = "business"
+	p.AddAccount(acc)
 	log.Printf("[account] loaded single account: %s (aid=%s)", acc.UserName, acc.ShortSpaceID())
 	return nil
 }
@@ -600,6 +635,8 @@ func (p *AccountPool) isUnusable(acc *Account) bool {
 func (p *AccountPool) applyWorkspaceCount(acc *Account, count int) (prev int, changed bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
 	prev = acc.SpaceCount
 	hadCheck := acc.WorkspaceCheckedAt != nil
 	now := time.Now()
@@ -647,7 +684,7 @@ type quotaApplyResult struct {
 // transition without re-locking.
 func (p *AccountPool) applyQuotaInfo(acc *Account, info *QuotaInfo) quotaApplyResult {
 	acc.mu.Lock()
-	defer acc.mu.Unlock()
+	defer func() { acc.mu.Unlock(); p.routingQuotaUpdated(acc, info) }()
 	res := quotaApplyResult{WasPermanent: acc.PermanentlyExhausted}
 	now := time.Now()
 	acc.QuotaInfo = cloneQuotaInfo(info)
@@ -658,7 +695,7 @@ func (p *AccountPool) applyQuotaInfo(acc *Account, info *QuotaInfo) quotaApplyRe
 	res.BasicLeft = basicRemaining(info)
 	res.HasPremium = info.HasPremium
 	if info.IsEligible {
-		if acc.PermanentlyExhausted {
+		if acc.PermanentlyExhausted && accountIsLifetimeFree(acc, info) {
 			return res
 		}
 		if acc.QuotaExhaustedAt != nil {
@@ -672,20 +709,28 @@ func (p *AccountPool) applyQuotaInfo(acc *Account, info *QuotaInfo) quotaApplyRe
 	if acc.QuotaExhaustedAt == nil {
 		acc.QuotaExhaustedAt = &now
 	}
-	isFree := false
-	if !(info.HasPremium || info.PremiumLimit > 0 || info.PremiumBalance > 0) {
-		switch strings.ToLower(strings.TrimSpace(acc.PlanType)) {
-		case "personal", "free", "":
-			isFree = true
-		default:
-			isFree = !info.HasPremium
-		}
-	}
-	if isFree {
+	if accountIsLifetimeFree(acc, info) {
 		acc.PermanentlyExhausted = true
 		res.NowPermanent = true
 	}
 	return res
+}
+
+// Subscription identity is independent of whether this quota snapshot exposes premium credits.
+func accountIsLifetimeFree(acc *Account, info *QuotaInfo) bool {
+	switch strings.ToLower(strings.TrimSpace(acc.PlanType)) {
+	case "business", "plus", "enterprise":
+		return false
+	}
+	if info != nil && (info.HasPremium || info.PremiumLimit > 0 || info.PremiumBalance > 0) {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(acc.PlanType)) {
+	case "personal", "free", "":
+		return true
+	default:
+		return info != nil && !info.HasPremium
+	}
 }
 
 // RefreshAccountQuota performs a live quota check for a single account.
@@ -704,10 +749,7 @@ func (p *AccountPool) RefreshAccountQuota(acc *Account, minInterval time.Duratio
 	// Cached fast path: avoid hammering Notion on tight retry loops.
 	quota := acc.quotaSnapshot()
 	if minInterval > 0 && quota.CheckedAt != nil && time.Since(*quota.CheckedAt) < minInterval {
-		if quota.Info != nil {
-			return quota.Info.IsEligible
-		}
-		return !p.isQuotaExhaustedRLock(acc)
+		return accountHasInferenceQuota(acc)
 	}
 	// Mark this account as having an in-flight live check so async callers
 	// do not pile on. We intentionally still proceed even if another check
@@ -725,11 +767,7 @@ func (p *AccountPool) RefreshAccountQuota(acc *Account, minInterval time.Duratio
 	if err != nil {
 		log.Printf("[quota-live] %s check failed: %v (using cached state)", acc.UserEmail, err)
 		// On error, trust the cached snapshot — return current eligibility.
-		quota := acc.quotaSnapshot()
-		if quota.Info != nil {
-			return quota.Info.IsEligible
-		}
-		return !p.isQuotaExhaustedRLock(acc)
+		return accountHasInferenceQuota(acc)
 	}
 
 	res := p.applyQuotaInfo(acc, info)
@@ -746,7 +784,16 @@ func (p *AccountPool) RefreshAccountQuota(acc *Account, minInterval time.Duratio
 		log.Printf("[quota-live] %s eligible (basic remaining ~%d, premium=%v)",
 			acc.UserEmail, res.BasicLeft, res.HasPremium)
 	}
-	return info.IsEligible
+	return accountHasInferenceQuota(acc)
+}
+
+func accountHasInferenceQuota(acc *Account) bool {
+	quota := acc.quotaSnapshot()
+	if quota.PermanentlyExhausted || quota.ExhaustedAt != nil || (quota.Info != nil && !quota.Info.IsEligible) {
+		return false
+	}
+	blocked, _ := routingAllowanceBlocked(quota.Info)
+	return !blocked
 }
 
 // RefreshAccountQuotaAsync triggers a live quota check in the background.
@@ -764,6 +811,7 @@ func (p *AccountPool) RefreshAccountQuotaAsync(acc *Account) {
 	}
 	p.liveQuotaInflight[acc] = true
 	p.liveQuotaMu.Unlock()
+	fetchQuota := quotaFetcher
 
 	go func() {
 		defer func() {
@@ -771,7 +819,7 @@ func (p *AccountPool) RefreshAccountQuotaAsync(acc *Account) {
 			delete(p.liveQuotaInflight, acc)
 			p.liveQuotaMu.Unlock()
 		}()
-		info, err := quotaFetcher(acc)
+		info, err := fetchQuota(acc)
 		if err != nil {
 			log.Printf("[quota-live-async] %s check failed: %v", acc.UserEmail, err)
 			return
@@ -912,14 +960,26 @@ func (p *AccountPool) Count() int {
 // GetByEmail returns an available (non-exhausted, has workspace) account
 // by email, or nil if not found / exhausted / has no workspace.
 func (p *AccountPool) GetByEmail(email string) *Account {
+	acc, err := p.FindByEmail(email)
+	if err != nil {
+		return nil
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	for _, acc := range p.accounts {
-		if acc.UserEmail == email && !p.isUnusable(acc) {
-			return acc
-		}
+	if p.isUnusable(acc) {
+		return nil
 	}
-	return nil
+	return acc
+}
+
+func (p *AccountPool) GetByAccountID(id string) *Account {
+	acc := p.FindByAccountID(id)
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if acc == nil || p.isUnusable(acc) {
+		return nil
+	}
+	return acc
 }
 
 // FindByEmail returns all accounts matching the given email.
@@ -930,6 +990,7 @@ func (p *AccountPool) FindByEmail(email string) (*Account, error) {
 	var matches []*Account
 	for _, acc := range p.accounts {
 		if strings.EqualFold(acc.UserEmail, email) {
+			acc.EnsureAccountID()
 			matches = append(matches, acc)
 		}
 	}
@@ -1068,15 +1129,14 @@ func (p *AccountPool) RefreshAll(accountsDir string) {
 		quota := acc.quotaSnapshot()
 		// Skip permanently exhausted accounts (free plan, no recovery possible)
 		if quota.PermanentlyExhausted {
-			if isFreePlan(acc) {
+			if accountIsLifetimeFree(acc, quota.Info) {
 				log.Printf("[refresh] %s (%s): permanently exhausted, skipped", acc.UserName, acc.UserEmail)
 				p.refreshMu.Lock()
 				p.refreshDone++
 				p.refreshMu.Unlock()
 				continue
 			}
-			log.Printf("[refresh] %s (%s): clearing stale permanent exhaustion flag before re-check", acc.UserName, acc.UserEmail)
-			p.ClearQuotaExhausted(acc)
+			log.Printf("[refresh] %s (%s): re-checking stale permanent exhaustion flag", acc.UserName, acc.UserEmail)
 		}
 
 		wg.Add(1)
@@ -1130,6 +1190,7 @@ func (p *AccountPool) RefreshAll(accountsDir string) {
 				log.Printf("[refresh] %s (%s): model fetch failed: %v", acc.UserName, acc.UserEmail, err)
 			} else if len(models) > 0 {
 				acc.setModels(models)
+				p.routingModelsUpdated(acc)
 				modelsUpdatedFlag.Store(true)
 				log.Printf("[refresh] %s (%s): fetched %d models", acc.UserName, acc.UserEmail, len(models))
 			}
@@ -1216,9 +1277,7 @@ func (p *AccountPool) SaveAccounts(dir string) {
 //
 // The write is atomic (tmp + os.Rename) so a crash mid-save can't leave
 // LoadFromDir staring at a half-written JSON. Callers should hold no
-// AccountPool lock — we read acc fields directly so concurrent updates by
-// applyQuotaInfo are protected by Go's safe-map / pointer guarantees on
-// the small primitives we copy.
+// AccountPool lock. Runtime fields are copied under the account lock.
 //
 // Returns an error if no on-disk file matches acc.UserEmail; that is a
 // real-world signal someone deleted the account file out from under us.
@@ -1229,6 +1288,9 @@ func saveAccountFile(dir string, acc *Account) error {
 	if dir == "" {
 		return fmt.Errorf("saveAccountFile: empty dir")
 	}
+	acc.EnsureAccountID()
+	accountSaveMu.Lock()
+	defer accountSaveMu.Unlock()
 	if err := ensurePrivateAccountsDir(dir); err != nil {
 		return fmt.Errorf("secure accounts dir: %w", err)
 	}
@@ -1252,7 +1314,6 @@ func saveAccountFile(dir string, acc *Account) error {
 			continue
 		}
 		// Match by account_id first, fall back to user_id+space_id
-		acc.EnsureAccountID()
 		exAID, _ := raw["account_id"].(string)
 		if exAID == "" {
 			exUID, _ := raw["user_id"].(string)
@@ -1271,42 +1332,54 @@ func saveAccountFile(dir string, acc *Account) error {
 	if matchPath == "" {
 		return fmt.Errorf("no account file matches account_id for %s", acc.UserEmail)
 	}
+	quota := acc.quotaSnapshot()
+	models := acc.modelsSnapshot()
+	acc.mu.RLock()
+	verifiedAt := cloneTimePtr(acc.BusinessVerifiedAt)
+	workspaceCheckedAt := cloneTimePtr(acc.WorkspaceCheckedAt)
+	spaceCount := acc.SpaceCount
+	acc.mu.RUnlock()
 
 	// Migrate: persist account_id into legacy files
 	if acc.AccountID != "" {
 		existing["account_id"] = acc.AccountID
 	}
+	if verifiedAt != nil {
+		existing["business_verified_at"] = verifiedAt.Format(time.RFC3339Nano)
+	}
 
-	if len(acc.Models) > 0 {
-		modelEntries := make([]map[string]string, 0, len(acc.Models))
-		for _, m := range acc.Models {
+	if len(models) > 0 {
+		modelEntries := make([]map[string]string, 0, len(models))
+		for _, m := range models {
 			modelEntries = append(modelEntries, map[string]string{"id": m.ID, "name": m.Name})
 		}
 		existing["available_models"] = modelEntries
 	}
-	if acc.QuotaInfo != nil {
+	if quota.Info != nil {
 		existing["quota_info"] = map[string]interface{}{
-			"rate_limit":          acc.QuotaInfo.RateLimit,
-			"rate_limit_error":    acc.QuotaInfo.RateLimitError,
-			"is_eligible":         acc.QuotaInfo.IsEligible,
-			"space_usage":         acc.QuotaInfo.SpaceUsage,
-			"space_limit":         acc.QuotaInfo.SpaceLimit,
-			"user_usage":          acc.QuotaInfo.UserUsage,
-			"user_limit":          acc.QuotaInfo.UserLimit,
-			"last_usage_at":       acc.QuotaInfo.LastUsageAtMs,
-			"research_mode_usage": acc.QuotaInfo.ResearchModeUsage,
-			"has_premium":         acc.QuotaInfo.HasPremium,
-			"premium_balance":     acc.QuotaInfo.PremiumBalance,
-			"premium_usage":       acc.QuotaInfo.PremiumUsage,
-			"premium_limit":       acc.QuotaInfo.PremiumLimit,
+			"rate_limit":            quota.Info.RateLimit,
+			"rate_limit_error":      quota.Info.RateLimitError,
+			"is_eligible":           quota.Info.IsEligible,
+			"space_usage":           quota.Info.SpaceUsage,
+			"space_limit":           quota.Info.SpaceLimit,
+			"user_usage":            quota.Info.UserUsage,
+			"user_limit":            quota.Info.UserLimit,
+			"last_usage_at":         quota.Info.LastUsageAtMs,
+			"research_mode_usage":   quota.Info.ResearchModeUsage,
+			"has_premium":           quota.Info.HasPremium,
+			"premium_balance":       quota.Info.PremiumBalance,
+			"premium_balance_known": quota.Info.PremiumBalanceKnown,
+			"quota_status_reason":   quota.Info.QuotaStatusReason,
+			"premium_usage":         quota.Info.PremiumUsage,
+			"premium_limit":         quota.Info.PremiumLimit,
 		}
 	}
-	if acc.QuotaCheckedAt != nil {
-		existing["quota_checked_at"] = acc.QuotaCheckedAt.Format(time.RFC3339)
+	if quota.CheckedAt != nil {
+		existing["quota_checked_at"] = quota.CheckedAt.Format(time.RFC3339)
 	}
-	if acc.WorkspaceCheckedAt != nil {
-		existing["space_count"] = acc.SpaceCount
-		existing["workspace_checked_at"] = acc.WorkspaceCheckedAt.Format(time.RFC3339)
+	if workspaceCheckedAt != nil {
+		existing["space_count"] = spaceCount
+		existing["workspace_checked_at"] = workspaceCheckedAt.Format(time.RFC3339)
 	}
 
 	out, err := json.MarshalIndent(existing, "", "  ")
@@ -1348,15 +1421,16 @@ func (p *AccountPool) RefreshAndPersistAccount(ctx context.Context, accountsDir,
 		return fmt.Errorf("RefreshAndPersistAccount: empty email")
 	}
 
-	p.mu.RLock()
 	var acc *Account
-	for _, a := range p.accounts {
-		if strings.EqualFold(strings.TrimSpace(a.UserEmail), target) {
-			acc = a
-			break
-		}
+	var lookupErr error
+	if isAccountID(target) {
+		acc = p.FindByAccountID(target)
+	} else {
+		acc, lookupErr = p.FindByEmail(target)
 	}
-	p.mu.RUnlock()
+	if lookupErr != nil {
+		return lookupErr
+	}
 	if acc == nil {
 		return fmt.Errorf("account not in pool: %s", email)
 	}
@@ -1371,9 +1445,8 @@ func (p *AccountPool) RefreshAndPersistAccount(ctx context.Context, accountsDir,
 	if mErr != nil {
 		log.Printf("[post-register] %s: models fetch failed: %v (persisting quota only)", acc.UserEmail, mErr)
 	} else if len(models) > 0 {
-		p.mu.Lock()
-		acc.Models = models
-		p.mu.Unlock()
+		acc.setModels(models)
+		p.routingModelsUpdated(acc)
 	}
 
 	// Workspace probe is best-effort. If it fails we still persist the
@@ -1394,8 +1467,11 @@ func (p *AccountPool) RefreshAndPersistAccount(ctx context.Context, accountsDir,
 	if err := saveAccountFile(accountsDir, acc); err != nil {
 		return fmt.Errorf("persist: %w", err)
 	}
+	p.mu.RLock()
+	spaceCount := acc.SpaceCount
+	p.mu.RUnlock()
 	log.Printf("[post-register] %s: quota refreshed and persisted (eligible=%v, space %d/%d, workspaces=%d)",
-		acc.UserEmail, info.IsEligible, info.SpaceUsage, info.SpaceLimit, acc.SpaceCount)
+		acc.UserEmail, info.IsEligible, info.SpaceUsage, info.SpaceLimit, spaceCount)
 	return nil
 }
 
@@ -1420,15 +1496,21 @@ func (p *AccountPool) GetAccountDetails() []map[string]interface{} {
 		models := acc.modelsSnapshot()
 		acc.EnsureAccountID()
 		entry := map[string]interface{}{
-			"account_id":     acc.AccountID,
-			"email":          acc.UserEmail,
-			"name":           acc.UserName,
-			"plan":           acc.PlanType,
-			"space":          acc.SpaceName,
-			"space_id_short": acc.ShortSpaceID(),
-			"exhausted":      p.isQuotaExhausted(acc),
-			"permanent":      quota.PermanentlyExhausted,
-			"no_workspace":   p.hasNoWorkspace(acc),
+			"account_id":          acc.AccountID,
+			"email":               acc.UserEmail,
+			"name":                acc.UserName,
+			"plan":                acc.PlanType,
+			"space":               acc.SpaceName,
+			"space_id":            acc.SpaceID,
+			"space_id_short":      acc.ShortSpaceID(),
+			"exhausted":           p.isQuotaExhausted(acc),
+			"permanent":           quota.PermanentlyExhausted,
+			"no_workspace":        p.hasNoWorkspace(acc),
+			"subscription_status": "legacy_unverified",
+		}
+		if acc.BusinessVerifiedAt != nil {
+			entry["subscription_status"] = "verified_business"
+			entry["business_verified_at"] = acc.BusinessVerifiedAt.Format(time.RFC3339Nano)
 		}
 		if acc.WorkspaceCheckedAt != nil {
 			entry["space_count"] = acc.SpaceCount
@@ -1456,6 +1538,11 @@ func (p *AccountPool) GetAccountDetails() []map[string]interface{} {
 			// Premium credit data (V2)
 			entry["has_premium"] = quota.Info.HasPremium
 			entry["premium_balance"] = quota.Info.PremiumBalance
+			entry["premium_balance_known"] = quota.Info.PremiumBalanceKnown
+			entry["quota_status_reason"] = quota.Info.QuotaStatusReason
+			if !quota.Info.PremiumBalanceKnown {
+				entry["premium_balance"] = nil
+			}
 			entry["premium_usage"] = quota.Info.PremiumUsage
 			entry["premium_limit"] = quota.Info.PremiumLimit
 		}
@@ -1512,6 +1599,11 @@ func (p *AccountPool) GetQuotaSummary() []map[string]interface{} {
 			// Premium credit data (V2)
 			entry["has_premium"] = quota.Info.HasPremium
 			entry["premium_balance"] = quota.Info.PremiumBalance
+			entry["premium_balance_known"] = quota.Info.PremiumBalanceKnown
+			entry["quota_status_reason"] = quota.Info.QuotaStatusReason
+			if !quota.Info.PremiumBalanceKnown {
+				entry["premium_balance"] = nil
+			}
 			entry["premium_usage"] = quota.Info.PremiumUsage
 			entry["premium_limit"] = quota.Info.PremiumLimit
 		}
@@ -1552,39 +1644,46 @@ func loadPersistedWorkspace(data []byte, acc *Account) {
 func loadPersistedQuotaInfo(data []byte) *QuotaInfo {
 	var raw struct {
 		QuotaInfo *struct {
-			RateLimit         *CreditRateLimit `json:"rate_limit"`
-			RateLimitError    string           `json:"rate_limit_error"`
-			IsEligible        bool             `json:"is_eligible"`
-			SpaceUsage        int              `json:"space_usage"`
-			SpaceLimit        int              `json:"space_limit"`
-			UserUsage         int              `json:"user_usage"`
-			UserLimit         int              `json:"user_limit"`
-			LastUsageAt       int64            `json:"last_usage_at"`
-			ResearchModeUsage int              `json:"research_mode_usage"`
-			HasPremium        bool             `json:"has_premium"`
-			PremiumBalance    int              `json:"premium_balance"`
-			PremiumUsage      int              `json:"premium_usage"`
-			PremiumLimit      int              `json:"premium_limit"`
+			RateLimit           *CreditRateLimit `json:"rate_limit"`
+			RateLimitError      string           `json:"rate_limit_error"`
+			IsEligible          bool             `json:"is_eligible"`
+			SpaceUsage          int              `json:"space_usage"`
+			SpaceLimit          int              `json:"space_limit"`
+			UserUsage           int              `json:"user_usage"`
+			UserLimit           int              `json:"user_limit"`
+			LastUsageAt         int64            `json:"last_usage_at"`
+			ResearchModeUsage   int              `json:"research_mode_usage"`
+			HasPremium          bool             `json:"has_premium"`
+			PremiumBalance      *int             `json:"premium_balance"`
+			PremiumBalanceKnown bool             `json:"premium_balance_known"`
+			QuotaStatusReason   string           `json:"quota_status_reason"`
+			PremiumUsage        int              `json:"premium_usage"`
+			PremiumLimit        int              `json:"premium_limit"`
 		} `json:"quota_info"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil || raw.QuotaInfo == nil {
 		return nil
 	}
-	return &QuotaInfo{
-		RateLimit:         raw.QuotaInfo.RateLimit,
-		RateLimitError:    raw.QuotaInfo.RateLimitError,
-		IsEligible:        raw.QuotaInfo.IsEligible,
-		SpaceUsage:        raw.QuotaInfo.SpaceUsage,
-		SpaceLimit:        raw.QuotaInfo.SpaceLimit,
-		UserUsage:         raw.QuotaInfo.UserUsage,
-		UserLimit:         raw.QuotaInfo.UserLimit,
-		LastUsageAtMs:     raw.QuotaInfo.LastUsageAt,
-		ResearchModeUsage: raw.QuotaInfo.ResearchModeUsage,
-		HasPremium:        raw.QuotaInfo.HasPremium,
-		PremiumBalance:    raw.QuotaInfo.PremiumBalance,
-		PremiumUsage:      raw.QuotaInfo.PremiumUsage,
-		PremiumLimit:      raw.QuotaInfo.PremiumLimit,
+	info := &QuotaInfo{
+		RateLimit:           raw.QuotaInfo.RateLimit,
+		RateLimitError:      raw.QuotaInfo.RateLimitError,
+		IsEligible:          raw.QuotaInfo.IsEligible,
+		SpaceUsage:          raw.QuotaInfo.SpaceUsage,
+		SpaceLimit:          raw.QuotaInfo.SpaceLimit,
+		UserUsage:           raw.QuotaInfo.UserUsage,
+		UserLimit:           raw.QuotaInfo.UserLimit,
+		LastUsageAtMs:       raw.QuotaInfo.LastUsageAt,
+		ResearchModeUsage:   raw.QuotaInfo.ResearchModeUsage,
+		HasPremium:          raw.QuotaInfo.HasPremium,
+		PremiumBalanceKnown: raw.QuotaInfo.PremiumBalanceKnown && raw.QuotaInfo.PremiumBalance != nil,
+		QuotaStatusReason:   raw.QuotaInfo.QuotaStatusReason,
+		PremiumUsage:        raw.QuotaInfo.PremiumUsage,
+		PremiumLimit:        raw.QuotaInfo.PremiumLimit,
 	}
+	if raw.QuotaInfo.PremiumBalance != nil {
+		info.PremiumBalance = *raw.QuotaInfo.PremiumBalance
+	}
+	return info
 }
 
 func quotaRemaining(limit, usage int) int {
@@ -1634,8 +1733,11 @@ func accountQuotaPriority(acc *Account) int {
 	if quota == nil {
 		return -1
 	}
+	if quota.HasPremium && !quota.PremiumBalanceKnown {
+		return -1
+	}
 	score := basicRemaining(quota)
-	if quota.HasPremium {
+	if quota.HasPremium && quota.PremiumBalanceKnown {
 		// Premium balance often dwarfs basic credits — fold it in so premium
 		// accounts win over basic-only accounts when both are eligible.
 		score += quota.PremiumBalance

@@ -16,6 +16,7 @@ type Session struct {
 	ThreadID     string // Notion threadId (generated on first turn, reused)
 	TurnCount    int    // completed conversation turns (user+assistant pairs)
 	AccountEmail string // bound account (thread is tied to the creating account)
+	AccountID    string // canonical user + workspace identity; email is display-only
 	CreatedAt    time.Time
 	LastUsedAt   time.Time
 
@@ -45,6 +46,7 @@ type SessionManager struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session
 	ttl      time.Duration
+	active   map[string]bool
 }
 
 // globalSessionManager is the package-level session manager instance
@@ -77,14 +79,22 @@ func (sm *SessionManager) Get(fingerprint string) *Session {
 	if time.Since(s.LastUsedAt) > sm.ttl {
 		return nil
 	}
-	return s
+	copy := *s
+	copy.UpdatedConfigIDs = append([]string(nil), s.UpdatedConfigIDs...)
+	return &copy
 }
 
 // Set stores a session for the given fingerprint.
 func (sm *SessionManager) Set(fingerprint string, session *Session) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	sm.sessions[fingerprint] = session
+	if session == nil {
+		delete(sm.sessions, fingerprint)
+		return
+	}
+	copy := *session
+	copy.UpdatedConfigIDs = append([]string(nil), session.UpdatedConfigIDs...)
+	sm.sessions[fingerprint] = &copy
 }
 
 // Delete removes a session by fingerprint.
@@ -103,6 +113,31 @@ func (sm *SessionManager) DeleteByAccount(email string) {
 			delete(sm.sessions, fp)
 		}
 	}
+}
+
+func (sm *SessionManager) DeleteByAccountID(accountID string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	for fp, session := range sm.sessions {
+		if session.AccountID == accountID {
+			delete(sm.sessions, fp)
+		}
+	}
+}
+
+// Acquire rejects overlapping turns without retaining a queue or a goroutine.
+func (sm *SessionManager) Acquire(fingerprint string) (func(), bool) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.active == nil {
+		sm.active = make(map[string]bool)
+	}
+	if sm.active[fingerprint] {
+		return nil, false
+	}
+	sm.active[fingerprint] = true
+	var once sync.Once
+	return func() { once.Do(func() { sm.mu.Lock(); delete(sm.active, fingerprint); sm.mu.Unlock() }) }, true
 }
 
 // Count returns the number of active sessions.

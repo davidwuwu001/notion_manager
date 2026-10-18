@@ -1,4 +1,45 @@
-import type { DashboardData, JobStartResponse, ProviderInfo, RegisterJob, TokenStats } from './types'
+import type { DashboardData, JobStartResponse, ProviderInfo, RegisterJob, TokenStats, RequestAnalytics, RequestLogList, RequestLogDetail, RoutingConfig, RoutingData, Model } from './types'
+import { filterParams } from './dashboard.ts'
+import type { LogFilters } from './dashboard'
+
+async function adminRequest<T>(url: string, init: RequestInit = {}): Promise<T> {
+  const response = await fetch(url, { credentials: 'same-origin', ...init, headers: { Accept: 'application/json', ...init.headers } })
+  if (response.status === 401) window.dispatchEvent(new Event('notion-manager-unauthorized'))
+  const body = await readJson<T & { error?: string }>(response, `HTTP ${response.status}: invalid JSON response`)
+  if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`)
+  return body
+}
+
+export function fetchManagedModels(signal?: AbortSignal): Promise<{ model_map: Record<string, string>; available_models: Model[]; public_models: Array<{ id: string }> }> {
+  return adminRequest('/admin/models', { signal })
+}
+
+export function fetchConnection(signal?: AbortSignal): Promise<{ api_key: string }> {
+  return adminRequest('/admin/connection', { signal })
+}
+
+export function fetchRouting(signal?: AbortSignal): Promise<RoutingData> {
+  return adminRequest('/admin/routing', { signal })
+}
+
+export function updateRouting(config: RoutingConfig): Promise<RoutingData> {
+  return adminRequest('/admin/routing', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) })
+}
+
+export function fetchRequestLogs(filters: LogFilters, cursor = '', limit = 50, signal?: AbortSignal): Promise<RequestLogList> {
+  const params = filterParams(filters)
+  params.set('limit', String(limit))
+  if (cursor) params.set('cursor', cursor)
+  return adminRequest(`/admin/request-logs?${params}`, { signal })
+}
+
+export function fetchRequestLog(id: string, signal?: AbortSignal): Promise<RequestLogDetail> {
+  return adminRequest(`/admin/request-logs/${encodeURIComponent(id)}`, { signal })
+}
+
+export function fetchAnalytics(filters: LogFilters, signal?: AbortSignal): Promise<RequestAnalytics> {
+  return adminRequest(`/admin/analytics?${filterParams(filters)}`, { signal })
+}
 
 // --- Auth API ---
 
@@ -130,8 +171,9 @@ export interface AuthStatus {
   required: boolean
 }
 
-export async function checkAuth(): Promise<AuthStatus> {
+export async function checkAuth(signal?: AbortSignal): Promise<AuthStatus> {
   const resp = await fetch('/dashboard/auth/check', {
+    signal,
     headers: { Accept: 'application/json' },
     credentials: 'same-origin',
   })
@@ -166,7 +208,8 @@ export async function login(password: string): Promise<{ ok: boolean; error?: st
 }
 
 export async function logout(): Promise<void> {
-  await fetch('/dashboard/auth/logout', { method: 'POST', credentials: 'same-origin' })
+  const response = await fetch('/dashboard/auth/logout', { method: 'POST', credentials: 'same-origin' })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
 }
 
 // --- Dashboard API ---
@@ -177,7 +220,7 @@ export interface AccountListParams {
   query?: string
 }
 
-export async function fetchDashboardData(params: AccountListParams = {}): Promise<DashboardData> {
+export async function fetchDashboardData(params: AccountListParams = {}, signal?: AbortSignal): Promise<DashboardData> {
   // Uses dashboard session cookie for auth (not API key).
   // Server-side pagination keeps the payload small for big pools — see
   // proxy.HandleAdminAccounts for the contract.
@@ -187,22 +230,17 @@ export async function fetchDashboardData(params: AccountListParams = {}): Promis
   if (params.query && params.query.trim()) sp.set('q', params.query.trim())
   const qs = sp.toString()
   const url = qs ? `/admin/accounts?${qs}` : '/admin/accounts'
-  const resp = await fetch(url)
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-  return resp.json()
+  return adminRequest(url, { signal })
 }
 
 export async function triggerRefresh(): Promise<{ started: boolean; message?: string }> {
   // Uses dashboard session cookie for auth (not API key)
-  const resp = await fetch('/admin/refresh', { method: 'POST' })
-  return resp.json()
+  return adminRequest('/admin/refresh', { method: 'POST' })
 }
 
-export async function fetchTokenStats(): Promise<TokenStats> {
+export async function fetchTokenStats(signal?: AbortSignal): Promise<TokenStats> {
   // Uses dashboard session cookie for auth (not API key)
-  const resp = await fetch('/admin/stats')
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-  return resp.json()
+  return adminRequest('/admin/stats', { signal })
 }
 
 export function openProxy(accountId: string) {
@@ -223,17 +261,19 @@ export interface AddAccountResult {
     name: string
     email: string
     space: string
+    space_id?: string
     plan_type: string
   }
 }
 
-export async function addAccount(tokenV2: string): Promise<AddAccountResult> {
+export async function addAccount(tokenV2: string, notionUserId?: string, spaceId?: string): Promise<AddAccountResult> {
   const resp = await fetch('/admin/accounts/add', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     credentials: 'same-origin',
-    body: JSON.stringify({ token_v2: tokenV2 }),
+    body: JSON.stringify({ token_v2: tokenV2, notion_user_id: notionUserId, space_id: spaceId }),
   })
+  if (resp.status === 401) window.dispatchEvent(new Event('notion-manager-unauthorized'))
   const data = await readJson<AddAccountResult>(resp, '添加账号接口返回了无效响应')
   if (!resp.ok) return { error: data.error || `HTTP ${resp.status}` }
   return data
@@ -258,40 +298,23 @@ export interface SearchSettings {
   notion_proxy: string
 }
 
-export async function fetchSettings(): Promise<SearchSettings> {
+export async function fetchSettings(signal?: AbortSignal): Promise<SearchSettings> {
   // Uses dashboard session cookie for auth (not API key)
-  const resp = await fetch('/admin/settings')
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-  return resp.json()
+  return adminRequest('/admin/settings', { signal })
 }
 
 export async function updateSettings(settings: Partial<Pick<SearchSettings, 'enable_web_search' | 'enable_workspace_search' | 'ask_mode_default' | 'debug_logging' | 'notion_proxy'>>): Promise<SearchSettings> {
-  // Uses dashboard session cookie for auth (not API key)
-  const resp = await fetch('/admin/settings', {
+  return adminRequest('/admin/settings', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(settings),
   })
-  if (!resp.ok) {
-    // Surface server-side validation errors (e.g. unsupported proxy
-    // scheme) so the caller can show them in a toast and roll the input
-    // back instead of silently saving.
-    const text = await resp.text()
-    let msg = `HTTP ${resp.status}`
-    if (text) {
-      try {
-        const data = JSON.parse(text)
-        if (data && typeof data.error === 'string') msg = data.error
-      } catch { /* ignore */ }
-    }
-    throw new Error(msg)
-  }
-  return resp.json()
 }
 
 // --- Bulk Register Jobs API ---
 
 async function jsonOrError(resp: Response): Promise<any> {
+  if (resp.status === 401) window.dispatchEvent(new Event('notion-manager-unauthorized'))
   const text = await resp.text()
   let data: any = null
   if (text) {
@@ -345,17 +368,17 @@ export async function deleteRegisterJob(id: string): Promise<void> {
   await jsonOrError(resp)
 }
 
-export async function listJobs(limit = 50): Promise<RegisterJob[]> {
+export async function listJobs(limit = 50, signal?: AbortSignal): Promise<RegisterJob[]> {
   const resp = await fetch(`/admin/register/jobs?limit=${encodeURIComponent(String(limit))}`, {
-    credentials: 'same-origin',
+    credentials: 'same-origin', signal,
   })
   const data = await jsonOrError(resp)
   return Array.isArray(data) ? data : []
 }
 
-export async function getJob(id: string): Promise<RegisterJob> {
+export async function getJob(id: string, signal?: AbortSignal): Promise<RegisterJob> {
   const resp = await fetch(`/admin/register/jobs/${encodeURIComponent(id)}`, {
-    credentials: 'same-origin',
+    credentials: 'same-origin', signal,
   })
   return jsonOrError(resp) as Promise<RegisterJob>
 }

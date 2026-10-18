@@ -85,6 +85,9 @@ func TestLoadFromDir_SameUserSameSpace_Dedup(t *testing.T) {
 
 // Test 4: hot reload adds second workspace
 func TestReloadFromDir_AddsSecondWorkspace(t *testing.T) {
+	oldChecker := businessSubscriptionChecker
+	businessSubscriptionChecker = func(*Account) error { return nil }
+	t.Cleanup(func() { businessSubscriptionChecker = oldChecker })
 	dir := writeTempAccounts(t,
 		baseAccount("user-1", "space-aaa", "u@test.com", "User1"),
 	)

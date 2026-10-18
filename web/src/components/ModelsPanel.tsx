@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { fetchConnection, fetchManagedModels } from '../api'
 
 export function ModelsPanel() {
   const { t } = useTranslation()
@@ -9,6 +10,9 @@ export function ModelsPanel() {
   const [refresh, setRefresh] = useState(0)
   const [copied, setCopied] = useState('')
   const [copyError, setCopyError] = useState('')
+  const [apiKey, setApiKey] = useState('')
+  const [keyLoading, setKeyLoading] = useState(false)
+  const keyRequest = useRef<AbortController | null>(null)
   const origin = window.location.origin
   const buttonClass = 'shrink-0 rounded-md border border-border bg-bg-card px-3 py-1.5 text-[12px] text-text-primary hover:bg-bg-card-hover cursor-pointer disabled:opacity-50'
 
@@ -16,20 +20,35 @@ export function ModelsPanel() {
     const controller = new AbortController()
     setLoading(true)
     setError('')
-    const apiKey = document.querySelector('meta[name="api-key"]')?.getAttribute('content') || ''
-    fetch('/v1/models', { headers: { 'x-api-key': apiKey }, signal: controller.signal })
-      .then(async response => {
-        if (!response.ok) throw new Error(`HTTP ${response.status}`)
-        const body = await response.json()
-        if (!Array.isArray(body.data) || !body.data.every((model: { id?: unknown }) => model && typeof model.id === 'string')) {
+    fetchManagedModels(controller.signal)
+      .then(body => {
+        if (!Array.isArray(body.public_models) || !body.public_models.every((model: { id?: unknown }) => model && typeof model.id === 'string')) {
           throw new Error(t('models.invalid_response'))
         }
-        setModels([...new Set<string>(body.data.map((model: { id: string }) => model.id))].sort())
+        setModels([...new Set<string>(body.public_models.map(model => model.id))].sort())
       })
       .catch((err: Error) => { if (!controller.signal.aborted) setError(err.message) })
       .finally(() => { if (!controller.signal.aborted) setLoading(false) })
     return () => controller.abort()
   }, [refresh, t])
+
+  useEffect(() => () => { keyRequest.current?.abort() }, [])
+
+  async function revealKey(copyKey = false) {
+    keyRequest.current?.abort()
+    const controller = new AbortController()
+    keyRequest.current = controller
+    setKeyLoading(true); setCopyError('')
+    try {
+      const result = await fetchConnection(controller.signal)
+      if (controller.signal.aborted) return
+      if (typeof result.api_key !== 'string' || !result.api_key) throw new Error(t('upgrade.invalid_connection'))
+      if (copyKey) { await navigator.clipboard.writeText(result.api_key); setCopied('API Key') }
+      else setApiKey(result.api_key)
+    } catch (reason) {
+      if (!controller.signal.aborted) setCopyError(reason instanceof Error ? reason.message : t('models.copy_failed'))
+    } finally { if (!controller.signal.aborted) setKeyLoading(false) }
+  }
 
   async function copy(value: string) {
     setCopyError('')
@@ -52,6 +71,11 @@ export function ModelsPanel() {
       <section aria-label={t('models.connections')}>
         <h2 className="text-base font-semibold mb-2">{t('models.connections')}</h2>
         <p className="text-[12px] text-text-secondary mb-4">{t('models.address_note')}</p>
+        <div className="rounded-lg border border-border bg-bg-card p-4 mb-4 space-y-3">
+          <h3 className="font-medium text-[13px]">API Key</h3>
+          <code className="block break-all select-all text-[12px]">{apiKey || '••••••••••••••••'}</code>
+          <div className="flex flex-wrap gap-2"><button className={buttonClass} disabled={keyLoading} onClick={() => { if (apiKey) setApiKey(''); else void revealKey() }}>{t(apiKey ? 'api.hide' : 'api.show')}</button><button className={buttonClass} disabled={keyLoading} onClick={() => { void revealKey(true) }}>{t('upgrade.copy_key')}</button></div>
+        </div>
         <div className="grid gap-3 lg:grid-cols-3">
           {protocols.map(protocol => (
             <div key={protocol.name} className="rounded-lg border border-border bg-bg-card p-4 space-y-3">

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -210,6 +211,7 @@ func streamWebSearch(w http.ResponseWriter, flusher http.Flusher, acc *Account, 
 		{Role: "user", Content: query},
 	}
 	callOpts := buildWebSearchCallOptions(requestID, reasoningEffort)
+	callOpts.Context = inferenceContext(w)
 	callOpts.ThinkingBlocks = &thinkingBlocks
 	callOpts.KnownCitationURLs = &knownCitationURLs
 	callOpts.KnownCitationDocs = &knownCitationDocs
@@ -275,7 +277,7 @@ func streamWebSearch(w http.ResponseWriter, flusher http.Flusher, acc *Account, 
 		})
 	}
 
-	err := CallInference(acc, messages, model, false, func(delta string, done bool, usage *UsageInfo) {
+	err := inferenceCaller(acc, messages, model, false, func(delta string, done bool, usage *UsageInfo) {
 		if delta != "" {
 			// Check for new thinking blocks on each text delta
 			emitPendingThinking()
@@ -744,6 +746,11 @@ func handlePremiumFeatureUnavailable(pool *AccountPool, acc *Account) {
 func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		requestID := "msg_" + generateUUIDv4()
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		response := &inferenceWriter{ResponseWriter: w, ctx: ctx, cancel: cancel}
+		w = response
+		trace := TraceRequest(ctx)
 
 		if r.Method != http.MethodPost {
 			writeAnthropicError(w, requestID, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
@@ -802,13 +809,18 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 		}
 		model = stripped
 		resolvedModel := ResolveModel(model)
+		trace.SetRequest(req.Model, resolvedModel, req.Stream)
 		useReadOnlyMode := askFromModel || AppConfig.AskModeDefault()
 
 		// ── Detailed request logging ──
 		logAnthropicRequest(req, model)
 
 		// Convert Anthropic messages to internal ChatMessage format
-		messages, fileAttachments := convertAnthropicMessages(req.System, req.Messages)
+		messages, fileAttachments := convertAnthropicMessages(req.System, req.Messages, ctx)
+		if ctx.Err() != nil {
+			trace.FinishCancelled()
+			return
+		}
 		if len(fileAttachments) > 0 {
 			log.Printf("[upload-debug] extracted %d file attachment(s) from request", len(fileAttachments))
 		}
@@ -846,6 +858,11 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			enableWorkspaceSearch = &b
 			log.Printf("[search] X-Workspace-Search header override: %v", b)
 		}
+		workspaceSearchEnabled := AppConfig.WorkspaceSearchEnabled()
+		if enableWorkspaceSearch != nil {
+			workspaceSearchEnabled = *enableWorkspaceSearch
+		}
+		enableWorkspaceSearch = &workspaceSearchEnabled
 
 		// Convert Anthropic tools to OpenAI tools format for tool injection
 		hasTools := !isResearcher && len(req.Tools) > 0
@@ -862,6 +879,12 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 
 		if !isResearcher {
 			fingerprint = computeSessionFingerprintForRequest(messages, sessionSalt, resolvedModel)
+			releaseSession, ok := globalSessionManager.Acquire(fingerprint)
+			if !ok {
+				writeAnthropicError(w, requestID, http.StatusConflict, "another request is using this conversation", "invalid_request_error")
+				return
+			}
+			defer releaseSession()
 			session = globalSessionManager.Get(fingerprint)
 			rawMsgCount = countNonSystemMessages(messages)
 
@@ -931,62 +954,39 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 		originalMessages := cloneChatMessages(messages)
 
 		// Try accounts with automatic failover
-		tried := make(map[*Account]bool)
+		tried := make(map[string]bool)
 		maxAttempts := pool.Count()
-		var lastNonQuotaErr error
-		var sawEmptyResponse bool
-		var toolRecoveryMessages []ChatMessage
-		toolBridgeRetried := false
+		if budget := pool.RoutingSnapshot().MaxAttempts; budget > 0 && budget < maxAttempts {
+			maxAttempts = budget
+		}
 		liveCheckInterval := AppConfig.QuotaLiveCheckInterval()
 
 		for attempt := 0; attempt < maxAttempts; attempt++ {
-			var acc *Account
-
-			// Account binding: for subsequent turns, try the bound account first
-			// — but only if the account still has live quota, otherwise we'd
-			// burn a request just to discover it's exhausted.
-			if !isFirstTurn && session != nil && attempt == 0 {
-				bound := pool.GetByEmail(session.AccountEmail)
-				if bound != nil && pool.RefreshAccountQuota(bound, liveCheckInterval) {
-					acc = bound
-				} else {
-					reason := "unavailable"
-					if bound != nil {
-						reason = "quota exhausted on live check"
-					}
-					log.Printf("[session] bound account %s %s, will pick a new account and replay history",
-						session.AccountEmail, reason)
-					if bound != nil {
-						pool.MarkInferenceUnavailable(bound)
-					}
-					globalSessionManager.Delete(fingerprint)
-					session = nil
-					isFirstTurn = true
-					isRepeatTurn = false
-				}
+			if ctx.Err() != nil {
+				trace.FinishCancelled()
+				return
 			}
-
-			if acc == nil {
-				if isResearcher {
-					if attempt == 0 {
-						acc = pool.NextForResearch()
-					} else {
-						// Research-mode fallback also rotates through the pool.
-						acc = pool.NextExcluding(tried)
-					}
-				} else if attempt == 0 {
-					// New-conversation routing: pick the account with the
-					// highest remaining quota so high-quota accounts get used
-					// first, instead of round-robin.
-					acc = pool.NextBest()
-				} else {
-					// Failover: still prefer high-quota accounts among
-					// accounts we haven't tried yet.
-					acc = pool.NextBestExcluding(tried)
-				}
+			boundID := ""
+			if !isFirstTurn && session != nil {
+				boundID = session.AccountID
 			}
-			if acc == nil {
-				break
+			acc, release, selectionErr := pool.SelectForRequest(resolvedModel, isResearcher, tried, boundID)
+			if selectionErr != nil {
+				trace.FinishFailure("failed", "pool_unavailable")
+				writeAnthropicError(w, requestID, http.StatusServiceUnavailable, selectionErr.Error(), "overloaded_error")
+				return
+			}
+			defer release()
+			if session != nil && session.AccountID != acc.AccountID {
+				if workspaceSearchEnabled || len(fileAttachments) > 0 {
+					release()
+					writeAnthropicError(w, requestID, http.StatusConflict, "bound workspace unavailable; automatic cross-workspace replay is disabled", "api_error")
+					return
+				}
+				globalSessionManager.Delete(fingerprint)
+				session = nil
+				isFirstTurn = true
+				isRepeatTurn = false
 			}
 
 			// Live quota pre-check: ensure the cached state is fresh enough
@@ -994,11 +994,14 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			// Researcher mode has its own picker that already inspects quota.
 			if !isResearcher && !pool.RefreshAccountQuota(acc, liveCheckInterval) {
 				log.Printf("[quota-live] %s skipped (exhausted on live check)", acc.UserEmail)
-				tried[acc] = true
+				tried[acc.AccountID] = true
 				pool.MarkInferenceUnavailable(acc)
+				release()
 				continue
 			}
-			tried[acc] = true
+			tried[acc.AccountID] = true
+			attemptTrace := trace.BeginAttempt(acc.AccountID)
+			response.ctx = WithRequestAttempt(ctx, attemptTrace)
 
 			// Build the request payload for this attempt. We always start
 			// from the pristine `originalMessages` snapshot so a per-attempt
@@ -1021,8 +1024,6 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			requestMessages := attemptMessages
 			if !isResearcher && isFirstTurn {
 				switch {
-				case len(toolRecoveryMessages) > 0:
-					requestMessages = cloneChatMessages(toolRecoveryMessages)
 				case needsFreshThreadRecovery(attemptMessages):
 					collapsed := buildFreshThreadRecoveryMessages(attemptMessages)
 					if len(collapsed) == 1 {
@@ -1042,6 +1043,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 						ThreadID:         generateUUIDv4(),
 						TurnCount:        0,
 						AccountEmail:     acc.UserEmail,
+						AccountID:        acc.AccountID,
 						CreatedAt:        time.Now(),
 						LastUsedAt:       time.Now(),
 						ConfigID:         generateUUIDv4(),
@@ -1064,10 +1066,12 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 					target := uploadPlan[i]
 					log.Printf("[upload-debug] %s: uploading attachment %d/%d: %s (%s, %d bytes)",
 						requestID, i+1, len(fileAttachments), fa.FileName, fa.ContentType, len(fa.Data))
-					uploaded, err := UploadFileToNotionThread(acc, &fa, target.ThreadID, target.CreateThread)
+					uploaded, err := UploadFileToNotionThread(acc, &fa, target.ThreadID, target.CreateThread, response.ctx)
 					if err != nil {
+						attemptTrace.Finish(RequestAttemptResult{Outcome: "failed", ErrorCode: "upload_failed"})
+						trace.FinishFailure("failed", "upload_failed")
 						log.Printf("[upload] %s: attachment %d upload failed: %v", requestID, i+1, err)
-						writeAnthropicError(w, requestID, http.StatusBadGateway, "file upload failed: "+err.Error(), "api_error")
+						writeAnthropicError(w, requestID, http.StatusBadGateway, "file upload failed; no automatic replay", "api_error")
 						return
 					}
 					uploadedAttachments = append(uploadedAttachments, *uploaded)
@@ -1097,92 +1101,69 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			// selection has up-to-date numbers. Deduplicated per account so
 			// concurrent calls don't trigger redundant Notion API hits.
 			pool.RefreshAccountQuotaAsync(acc)
-
-			if reqErr != nil && errors.Is(reqErr, ErrResearchQuotaExhausted) {
-				// Research mode quota exhausted — account can still serve normal chat
-				quota := acc.quotaInfoSnapshot()
-				log.Printf("[research-quota] %s research quota exhausted (research_usage=%d), trying next account",
-					acc.UserEmail, func() int {
-						if quota != nil {
-							return quota.ResearchModeUsage
-						}
-						return -1
-					}())
-				continue
+			release()
+			if response.writeErr != nil {
+				reqErr = response.writeErr
 			}
-			if reqErr != nil && errors.Is(reqErr, ErrQuotaExhausted) {
-				if isFreePlan(acc) {
-					log.Printf("[quota] %s (free plan) quota exhausted — disabling permanently", acc.UserEmail)
-				} else {
-					log.Printf("[quota] %s quota exhausted — disabling until API-confirmed recovery", acc.UserEmail)
-				}
-				pool.MarkInferenceUnavailable(acc)
-				log.Printf("[quota] %s quota exhausted, trying next account (%d/%d available)",
-					acc.UserEmail, pool.AvailableCount(), pool.Count())
-				// Clear session if the bound account was exhausted
-				if !isFirstTurn && session != nil {
-					globalSessionManager.Delete(fingerprint)
-					session = nil
-					isFirstTurn = true
-					isRepeatTurn = false
-				}
-				continue
+			if ctx.Err() != nil {
+				reqErr = ctx.Err()
 			}
-
-			if reqErr != nil && errors.Is(reqErr, ErrEmptyResponse) {
-				// Empty response — account/thread in bad state, clear session and try next account
-				log.Printf("[empty] %s returned empty response, trying next account", acc.UserEmail)
-				sawEmptyResponse = true
-				if currentSession != nil {
-					globalSessionManager.Delete(fingerprint)
-					session = nil
-					isFirstTurn = true
-					isRepeatTurn = false
-				}
-				continue
-			}
-
-			if reqErr != nil && errors.Is(reqErr, ErrToolBridgeNoTool) {
-				if !toolBridgeRetried {
-					log.Printf("[bridge] %s returned no-tool identity-drift text, clearing session and retrying once with sanitized recovery prompt", acc.UserEmail)
-					toolBridgeRetried = true
-					if fingerprint != "" {
-						globalSessionManager.Delete(fingerprint)
-					}
-					session = nil
-					isFirstTurn = true
-					isRepeatTurn = false
-					toolRecoveryMessages = buildToolBridgeRecoveryMessages(messages)
-					tried = make(map[*Account]bool)
-					attempt = -1
-					continue
-				}
-				lastNonQuotaErr = reqErr
-			}
-
-			if reqErr != nil && errors.Is(reqErr, ErrPremiumFeatureUnavailable) {
-				// Premium feature unavailable — for free accounts this means quota is permanently gone
-				handlePremiumFeatureUnavailable(pool, acc)
-				if !isFirstTurn && session != nil {
-					globalSessionManager.Delete(fingerprint)
-					session = nil
-					isFirstTurn = true
-					isRepeatTurn = false
-				}
-				continue
-			}
-
+			outcome, code := "success", ""
 			if reqErr != nil {
-				// Non-quota error — if this was a subsequent turn, try clearing session and retrying as first turn
-				if !isFirstTurn && session != nil {
-					log.Printf("[session] subsequent turn failed (%v), clearing session and falling back to first turn", reqErr)
-					globalSessionManager.Delete(fingerprint)
-					session = nil
-					isFirstTurn = true
-					isRepeatTurn = false
-					continue
+				outcome = "failed"
+				if ctx.Err() != nil {
+					outcome = "cancelled"
 				}
-				lastNonQuotaErr = reqErr
+				code = inferenceErrorCode(reqErr)
+			}
+			retryReason := ""
+			var cooldownUntil *int64
+			if reqErr != nil && ctx.Err() == nil {
+				switch {
+				case errors.Is(reqErr, ErrQuotaExhausted):
+					pool.MarkInferenceUnavailable(acc)
+				case errors.Is(reqErr, ErrResearchQuotaExhausted):
+					pool.SetRoutingFailure(acc.AccountID, resolvedModel, "research_exhausted", time.Time{})
+				case errors.Is(reqErr, ErrPremiumFeatureUnavailable):
+					handlePremiumFeatureUnavailable(pool, acc)
+				}
+				var he *notionHTTPError
+				if errors.As(reqErr, &he) && (he.Status == 401 || he.Status == 404 || he.Status == 429 || he.Status >= 500) {
+					reason := code
+					if he.Status >= 500 {
+						reason = "transient"
+					}
+					until := time.Now().Add(max(he.RetryAfter, 30*time.Second))
+					ms := until.UnixMilli()
+					cooldownUntil = &ms
+					pool.SetRoutingFailure(acc.AccountID, resolvedModel, reason, until)
+				} else if code == "transport_error" || code == "upstream_timeout" {
+					until := time.Now().Add(30 * time.Second)
+					ms := until.UnixMilli()
+					cooldownUntil = &ms
+					pool.SetRoutingFailure(acc.AccountID, resolvedModel, "transient", until)
+				}
+				if canReplayInference(reqErr, response.committed, len(fileAttachments) > 0 || workspaceSearchEnabled || isResearcher, useReadOnlyMode || isResearcher) && attempt+1 < maxAttempts {
+					retryReason = code
+				}
+			}
+			attemptTrace.Finish(RequestAttemptResult{Outcome: outcome, ErrorCode: code, RetryReason: retryReason, CooldownUntilMs: cooldownUntil, ResponseCommitted: response.committed, ContentEmitted: response.content, ToolCallEmitted: response.tool})
+			if reqErr != nil {
+				if ctx.Err() != nil {
+					trace.FinishCancelled()
+					return
+				}
+				// A submitted editing/upload/workspace request may already have side effects.
+				if !canReplayInference(reqErr, response.committed, len(fileAttachments) > 0 || workspaceSearchEnabled || isResearcher, useReadOnlyMode || isResearcher) {
+					trace.FinishFailure("failed", code)
+					writeAnthropicError(w, requestID, http.StatusBadGateway, "upstream interrupted ("+code+"); request was not replayed", "api_error")
+					return
+				}
+				globalSessionManager.Delete(fingerprint)
+				session = nil
+				isFirstTurn = true
+				isRepeatTurn = false
+				continue
 			}
 
 			// ── Success: save/update session ──
@@ -1207,29 +1188,26 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 					log.Printf("[session] updated session: thread=%s turns=%d rawMsgs=%d",
 						currentSession.ThreadID, currentSession.TurnCount, rawMsgCount)
 				}
+				globalSessionManager.Set(fingerprint, currentSession)
 			}
 
+			if r.Context().Value(anthropicBridgeContextKey{}) == nil {
+				trace.FinishSuccess()
+			}
 			return
 		}
 
-		if lastNonQuotaErr != nil {
-			writeAnthropicError(w, requestID, http.StatusBadGateway,
-				"notion API error: "+lastNonQuotaErr.Error(), "api_error")
-			return
+		reason := "no available account in pool"
+		if maxAttempts > 0 && len(tried) >= maxAttempts && maxAttempts < pool.Count() {
+			reason = "routing attempt budget exhausted"
 		}
-		if sawEmptyResponse {
-			writeAnthropicError(w, requestID, http.StatusBadGateway,
-				"notion returned empty response after retries", "api_error")
-			return
-		}
-		writeAnthropicError(w, requestID, http.StatusServiceUnavailable,
-			"all accounts exhausted after retries", "overloaded_error")
+		writeAnthropicError(w, requestID, http.StatusServiceUnavailable, reason, "overloaded_error")
 	}
 }
 
 // convertAnthropicMessages converts Anthropic system + messages to internal ChatMessage format.
 // It also extracts file attachments (image/document content blocks) for Notion upload.
-func convertAnthropicMessages(system interface{}, msgs []AnthropicMessage) ([]ChatMessage, []FileAttachment) {
+func convertAnthropicMessages(system interface{}, msgs []AnthropicMessage, contexts ...context.Context) ([]ChatMessage, []FileAttachment) {
 	var attachments []FileAttachment
 	var result []ChatMessage
 
@@ -1311,7 +1289,7 @@ func convertAnthropicMessages(system interface{}, msgs []AnthropicMessage) ([]Ch
 					case "image":
 						// Extract image from base64 or URL source
 						if source, ok := m["source"].(map[string]interface{}); ok {
-							fa := extractFileFromSource(source, "image")
+							fa := extractFileFromSource(source, "image", contexts...)
 							if fa != nil {
 								attachments = append(attachments, *fa)
 							}
@@ -1319,7 +1297,7 @@ func convertAnthropicMessages(system interface{}, msgs []AnthropicMessage) ([]Ch
 					case "document":
 						// Extract PDF/text document from base64, URL, or file source
 						if source, ok := m["source"].(map[string]interface{}); ok {
-							fa := extractFileFromSource(source, "document")
+							fa := extractFileFromSource(source, "document", contexts...)
 							if fa != nil {
 								attachments = append(attachments, *fa)
 							}
@@ -1364,7 +1342,7 @@ func convertAnthropicMessages(system interface{}, msgs []AnthropicMessage) ([]Ch
 
 // extractFileFromSource extracts file data from an Anthropic content block source.
 // Supports base64 and URL source types. blockKind is "image" or "document".
-func extractFileFromSource(source map[string]interface{}, blockKind string) *FileAttachment {
+func extractFileFromSource(source map[string]interface{}, blockKind string, contexts ...context.Context) *FileAttachment {
 	srcType, _ := source["type"].(string)
 
 	switch srcType {
@@ -1399,13 +1377,27 @@ func extractFileFromSource(source map[string]interface{}, blockKind string) *Fil
 			return nil
 		}
 		// Download the file from URL
-		resp, err := http.Get(urlStr)
+		ctx := context.Background()
+		if len(contexts) > 0 {
+			ctx = contexts[0]
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+		if err != nil {
+			return nil
+		}
+		resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(request)
 		if err != nil {
 			log.Printf("[upload] failed to download %s from URL: %v", blockKind, err)
 			return nil
 		}
 		defer resp.Body.Close()
-		data, err := io.ReadAll(resp.Body)
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil
+		}
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20+1))
+		if len(data) > 32<<20 {
+			return nil
+		}
 		if err != nil {
 			log.Printf("[upload] failed to read %s URL response: %v", blockKind, err)
 			return nil
@@ -1554,7 +1546,7 @@ func streamAnthropicTextResponse(w http.ResponseWriter, acc *Account, messages [
 		}
 	}
 
-	cbErr := CallInference(acc, messages, model, disableBuiltin, func(delta string, done bool, usage *UsageInfo) {
+	cbErr := inferenceCaller(acc, messages, model, disableBuiltin, func(delta string, done bool, usage *UsageInfo) {
 		if delta != "" {
 			fullContent.WriteString(delta)
 			if !jsonOnlyOutput {
@@ -1576,15 +1568,7 @@ func streamAnthropicTextResponse(w http.ResponseWriter, acc *Account, messages [
 	}, callOpts)
 
 	if cbErr != nil {
-		if !headersSent {
-			if errors.Is(cbErr, ErrQuotaExhausted) {
-				return cbErr
-			}
-			log.Printf("[err] %s: %v", requestID, cbErr)
-			writeAnthropicError(w, requestID, http.StatusBadGateway, "notion API error: "+cbErr.Error(), "api_error")
-			return nil
-		}
-		log.Printf("[err] %s: streaming completed with partial data before error: %v", requestID, cbErr)
+		return cbErr
 	}
 
 	if fullContent.Len() == 0 && !sawContent {
@@ -1714,6 +1698,7 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 	disableBuiltin := AppConfig.Proxy.DisableNotionPrompt
 
 	callOpts := CallOptions{
+		Context:               inferenceContext(w),
 		ThinkingBlocks:        &thinkingBlocks,
 		EnableWebSearch:       enableWebSearch,
 		EnableWorkspaceSearch: enableWorkspaceSearch,
@@ -1733,7 +1718,7 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 
 	callOpts.NativeToolUses = &nativeToolUses
 	// Format-based injection: tools embedded in user messages, use normal chat path
-	cbErr := CallInference(acc, messages, model, disableBuiltin, func(delta string, done bool, usage *UsageInfo) {
+	cbErr := inferenceCaller(acc, messages, model, disableBuiltin, func(delta string, done bool, usage *UsageInfo) {
 		if delta != "" {
 			fullContent.WriteString(delta)
 		}
@@ -1743,12 +1728,7 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 	}, callOpts)
 
 	if cbErr != nil {
-		if errors.Is(cbErr, ErrQuotaExhausted) {
-			return cbErr
-		}
-		log.Printf("[err] %s: %v", requestID, cbErr)
-		writeAnthropicError(w, requestID, http.StatusBadGateway, "notion API error: "+cbErr.Error(), "api_error")
-		return nil
+		return cbErr
 	}
 
 	contentStr := fullContent.String()
@@ -1906,6 +1886,7 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 			searchUsage, searchErr := streamWebSearch(w, flusher, acc, webSearchQuery, model, requestID, &blockIndex, hasThinking, outputConfigReasoningEffort(outputConfig))
 			if searchErr != nil {
 				log.Printf("[bridge] WebSearch streaming failed: %v", searchErr)
+				return searchErr
 			}
 			if searchUsage != nil && finalUsage != nil {
 				finalUsage.PromptTokens += searchUsage.PromptTokens
@@ -1993,6 +1974,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 	knownToolCallURLs := make(map[string][]string)
 
 	callOpts := CallOptions{
+		Context:               inferenceContext(w),
 		ThinkingBlocks:        &thinkingBlocks,
 		EnableWebSearch:       enableWebSearch,
 		EnableWorkspaceSearch: enableWorkspaceSearch,
@@ -2020,7 +2002,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 	if hasTools {
 		callOpts.NativeToolUses = &nativeToolUses
 		// Format-based injection: tools embedded in user messages, use normal chat path
-		err = CallInference(acc, messages, model, AppConfig.Proxy.DisableNotionPrompt, func(delta string, done bool, usage *UsageInfo) {
+		err = inferenceCaller(acc, messages, model, AppConfig.Proxy.DisableNotionPrompt, func(delta string, done bool, usage *UsageInfo) {
 			if delta != "" {
 				fullContent.WriteString(delta)
 			}
@@ -2029,7 +2011,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 			}
 		}, callOpts)
 	} else {
-		err = CallInference(acc, messages, model, AppConfig.Proxy.DisableNotionPrompt, func(delta string, done bool, usage *UsageInfo) {
+		err = inferenceCaller(acc, messages, model, AppConfig.Proxy.DisableNotionPrompt, func(delta string, done bool, usage *UsageInfo) {
 			if delta != "" {
 				fullContent.WriteString(delta)
 			}
@@ -2040,12 +2022,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 	}
 
 	if err != nil {
-		if errors.Is(err, ErrQuotaExhausted) {
-			return err
-		}
-		log.Printf("[err] %s: %v", requestID, err)
-		writeAnthropicError(w, requestID, http.StatusBadGateway, "notion API error: "+err.Error(), "api_error")
-		return nil
+		return err
 	}
 
 	content := fullContent.String()
@@ -2109,7 +2086,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 		// Intercept WebSearch tool calls → execute via Notion's native search
 		if prepared.WebSearchQuery != "" {
 			log.Printf("[bridge] WebSearch intercepted — executing via Notion native search: %q", prepared.WebSearchQuery)
-			searchResult, searchUsage, searchErr := executeWebSearch(acc, prepared.WebSearchQuery, model, requestID, outputConfigReasoningEffort(outputConfig))
+			searchResult, searchUsage, searchErr := executeWebSearch(acc, prepared.WebSearchQuery, model, requestID, outputConfigReasoningEffort(outputConfig), inferenceContext(w))
 			if searchErr == nil && searchResult != "" {
 				if doneText != "" {
 					doneText = doneText + "\n\n" + searchResult
@@ -2123,11 +2100,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 				}
 			} else if searchErr != nil {
 				log.Printf("[bridge] WebSearch execution failed: %v", searchErr)
-				if doneText != "" {
-					doneText = doneText + "\n\nWeb search failed: " + searchErr.Error()
-				} else {
-					doneText = "Web search failed: " + searchErr.Error()
-				}
+				return searchErr
 			}
 		}
 
@@ -2178,6 +2151,20 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 }
 
 func sendAnthropicSSE(w http.ResponseWriter, flusher http.Flusher, eventType string, data interface{}) {
+	if iw, ok := w.(*inferenceWriter); ok {
+		if eventType == "content_block_delta" {
+			iw.content = true
+			TraceRequest(iw.ctx).MarkFirstToken()
+		}
+		if eventType == "content_block_start" {
+			if m, ok := data.(map[string]interface{}); ok {
+				if b, ok := m["content_block"].(map[string]interface{}); ok && b["type"] == "tool_use" {
+					iw.tool = true
+					TraceRequest(iw.ctx).MarkFirstToken()
+				}
+			}
+		}
+	}
 	raw, _ := json.Marshal(data)
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, raw)
 	flusher.Flush()
@@ -2403,6 +2390,7 @@ func handleResearcherStream(w http.ResponseWriter, acc *Account, messages []Chat
 
 	callOpts := CallOptions{
 		IsResearcher: true,
+		Context:      inferenceContext(w),
 		RequestID:    requestID,
 	}
 
@@ -2482,11 +2470,7 @@ func handleResearcherStream(w http.ResponseWriter, acc *Account, messages []Chat
 		if errors.Is(cbErr, ErrQuotaExhausted) || errors.Is(cbErr, ErrResearchQuotaExhausted) {
 			return cbErr
 		}
-		log.Printf("[err] %s researcher: %v", requestID, cbErr)
-		if !headersSent {
-			writeAnthropicError(w, requestID, http.StatusBadGateway, "notion researcher error: "+cbErr.Error(), "api_error")
-		}
-		return nil
+		return cbErr
 	}
 
 	// Close text block if started
@@ -2560,11 +2544,12 @@ func handleResearcherNonStream(w http.ResponseWriter, acc *Account, messages []C
 
 	callOpts := CallOptions{
 		IsResearcher:   true,
+		Context:        inferenceContext(w),
 		ThinkingBlocks: &thinkingBlocks,
 		RequestID:      requestID,
 	}
 
-	cbErr := CallInference(acc, messages, model, false, func(delta string, done bool, usage *UsageInfo) {
+	cbErr := inferenceCaller(acc, messages, model, false, func(delta string, done bool, usage *UsageInfo) {
 		if delta != "" {
 			fullContent.WriteString(delta)
 		}
@@ -2577,9 +2562,7 @@ func handleResearcherNonStream(w http.ResponseWriter, acc *Account, messages []C
 		if errors.Is(cbErr, ErrQuotaExhausted) || errors.Is(cbErr, ErrResearchQuotaExhausted) {
 			return cbErr
 		}
-		log.Printf("[err] %s researcher non-stream: %v", requestID, cbErr)
-		writeAnthropicError(w, requestID, http.StatusBadGateway, "notion researcher error: "+cbErr.Error(), "api_error")
-		return nil
+		return cbErr
 	}
 
 	aUsage := &AnthropicUsage{}
@@ -2636,6 +2619,19 @@ func writeAnthropicError(w http.ResponseWriter, requestID string, status int, me
 		},
 	}
 	LogAPIOutputJSON(requestID, fmt.Sprintf("anthropic error status=%d", status), payload)
+	if iw, ok := w.(*inferenceWriter); ok {
+		state := "failed"
+		if status >= 400 && status < 500 {
+			state = "rejected"
+		}
+		TraceRequest(iw.ctx).FinishFailure(state, errType)
+		if iw.committed {
+			if strings.Contains(w.Header().Get("Content-Type"), "text/event-stream") {
+				sendAnthropicSSE(w, iw, "error", payload)
+			}
+			return
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

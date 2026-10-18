@@ -14,6 +14,10 @@ accounts/*.json
 accounts/.register_inputs/
 accounts/.register_history.json
 accounts/.token_stats.json
+accounts/.routing.json
+accounts/.routing.json.*
+accounts/.request_logs.sqlite*
+test-evidence/
 .playwright-cli/
 .playwright-mcp/
 !accounts/example.json

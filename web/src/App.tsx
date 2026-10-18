@@ -1,15 +1,20 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
-import type { DashboardData, AccountInfo, AccountSummary, RefreshStatus, TokenStats } from './types'
-import { fetchDashboardData, openProxy, openBestProxy, checkAuth, login, logout, triggerRefresh, fetchSettings, updateSettings, addAccount, fetchTokenStats } from './api'
-import type { SearchSettings } from './api'
+import type { DashboardData, AccountInfo, AccountSummary, RefreshStatus, TokenStats, RoutingData, RoutingMember } from './types'
+import { fetchDashboardData, openProxy, openBestProxy, checkAuth, login, logout, triggerRefresh, addAccount, fetchTokenStats, fetchRouting, updateRouting } from './api'
 import { fmt, formatTokens, getQuotaStatusByUsage, getQuotaPct, avatarColor, avatarLetter, formatCheckedAt, formatTimestampMs, providerDisplay } from './utils'
 import { AccountMenu } from './components/AccountMenu'
-import { RegisterModal } from './components/RegisterModal'
-import { HistoryDrawer } from './components/HistoryDrawer'
 import { LanguageToggle } from './components/LanguageToggle'
 import { ModelsPanel } from './components/ModelsPanel'
-import { IconUserPlus, IconHistory } from './components/Icons'
+import { parseAccountImport } from './account-import'
+import type { AccountImport } from './account-import'
+import { dashboardTabs, dashboardTab, timestampValue, quotaRefreshProgress, confirmedPremiumBalance, metricValue, routingMetrics } from './dashboard'
+import type { DashboardTab } from './dashboard'
+import { OverviewPanel } from './components/OverviewPanel'
+import { LogsPanel } from './components/LogsPanel'
+import { AnalyticsPanel } from './components/AnalyticsPanel'
+import { SettingsPanel } from './components/SettingsPanel'
+import { ResourceState, buttonClass } from './components/DashboardShared'
 
 // --- Icons ---
 const IconBarChart = () => (
@@ -69,10 +74,13 @@ const IconTrash = () => (
 function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
   const { t } = useTranslation()
   const [token, setToken] = useState('')
+  const [importFile, setImportFile] = useState<{ name: string; config: AccountImport } | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
-  const [result, setResult] = useState<{ name: string; email: string; space: string; plan_type: string } | null>(null)
+  const [result, setResult] = useState<{ name: string; email: string; space: string; space_id?: string; plan_type: string } | null>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const successTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  useEffect(() => () => clearTimeout(successTimer.current), [])
 
   useEffect(() => { inputRef.current?.focus() }, [])
 
@@ -90,12 +98,15 @@ function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSucces
     setError('')
     setResult(null)
     try {
-      const res = await addAccount(trimmed)
+      let config: AccountImport
+      try { config = parseAccountImport(trimmed) }
+      catch { throw new Error(t('browser_import.invalid_json')) }
+      const res = await addAccount(config.token_v2, config.user_id, config.space_id)
       if (res.error) {
         setError(res.error)
       } else if (res.account) {
         setResult(res.account)
-        setTimeout(() => {
+        successTimer.current = setTimeout(() => {
           onSuccess()
           onClose()
         }, 1500)
@@ -109,7 +120,7 @@ function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSucces
 
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
-      <div className="w-full max-w-lg bg-[#1a1a1a] border border-white/10 rounded-xl shadow-2xl p-6" onClick={e => e.stopPropagation()}>
+      <div className="w-full max-w-lg max-h-[90vh] overflow-y-auto bg-[#1a1a1a] border border-white/10 rounded-xl shadow-2xl p-6" onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-[16px] font-semibold">{t('modal.add.title')}</h2>
           <button onClick={onClose} className="text-text-muted hover:text-white bg-transparent border-none cursor-pointer text-lg px-1">×</button>
@@ -120,15 +131,56 @@ function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSucces
           <p className="text-text-muted">{t('modal.add.how_to')}</p>
         </div>
 
+        <details className="rounded-lg border border-border bg-bg-card p-3 text-[12px] mb-4">
+          <summary className="font-medium text-text-primary cursor-pointer">{t('browser_import.title')}</summary>
+          <ol className="list-decimal pl-4 mt-2 space-y-2 text-text-secondary">
+            <li><a href="/dashboard/extension.zip" className="text-notion-blue underline" download>{t('browser_import.download')}</a>{t('browser_import.unzip')}</li>
+            <li>{t('browser_import.install')} <code className="select-all">chrome://extensions</code>{t('browser_import.load')}</li>
+            <li>{t('browser_import.use')}</li>
+          </ol>
+          <p className="mt-2 text-text-muted">{t('browser_import.privacy')}</p>
+          <p className="mt-2 text-text-muted">{t('browser_import.refresh')}</p>
+        </details>
+
         <form onSubmit={handleSubmit}>
-          <textarea
+          <label className="block text-[13px] font-medium mb-2" htmlFor="account-json-file">{t('browser_import.select_file')}</label>
+          <input id="account-json-file" type="file" accept=".json,application/json" disabled={loading} className="block w-full text-[12px] mb-3"
+            onChange={async event => {
+              const file = event.currentTarget.files?.[0]
+              event.currentTarget.value = ''
+              if (!file) return
+              setLoading(true)
+              setError('')
+              setResult(null)
+              setImportFile(null)
+              setToken('')
+              try {
+                if (file.size > 1024 * 1024) throw new Error(t('browser_import.file_too_large'))
+                const text = await file.text()
+                let config: AccountImport
+                try { config = parseAccountImport(text, true) }
+                catch { throw new Error(t('browser_import.invalid_json')) }
+                setImportFile({ name: file.name, config })
+                setToken(JSON.stringify(config))
+              } catch (error) { setError(error instanceof Error ? error.message : t('browser_import.invalid_json')) }
+              finally { setLoading(false) }
+            }} />
+          {importFile && <div className="text-[12px] border border-border rounded-md p-3 mb-3 break-all space-y-1">
+            <p>{importFile.name}</p>
+            <p>{importFile.config.user_name || '—'} · {importFile.config.user_email || '—'}</p>
+            <p>{t('modal.add.space')} {importFile.config.space_name || '—'}</p>
+            <p>{t('account.workspace_id')} <code>{importFile.config.space_id || t('browser_import.auto_workspace')}</code></p>
+            <button type="button" className="text-notion-blue cursor-pointer" onClick={() => { setImportFile(null); setToken(''); setError(''); setResult(null) }}>{t('browser_import.use_manual')}</button>
+          </div>}
+          <p className="text-[11px] text-text-muted mb-2">{t('browser_import.file_privacy')}</p>
+          {!importFile && <textarea
             ref={inputRef}
             value={token}
             onChange={e => setToken(e.target.value)}
             placeholder={t('modal.add.placeholder')}
             rows={3}
             className="w-full py-2.5 px-3 bg-transparent border border-white/10 rounded-lg text-[13px] text-text-primary outline-none focus:border-white/30 focus:ring-1 focus:ring-white/10 transition-all placeholder:text-white/25 resize-none font-mono"
-          />
+          />}
           {error && (
             <div className="text-err text-[12px] mt-2 px-1">{error}</div>
           )}
@@ -138,6 +190,7 @@ function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSucces
               <div className="space-y-0.5 text-text-secondary">
                 <div>{t('modal.add.user')} <span className="text-white">{result.name}</span> ({result.email})</div>
                 <div>{t('modal.add.space')} <span className="text-white">{result.space}</span> · {result.plan_type}</div>
+                {result.space_id && <div className="break-all">{t('account.workspace_id')} {result.space_id}</div>}
               </div>
             </div>
           )}
@@ -235,13 +288,14 @@ function LoginPage({ onSuccess }: { onSuccess: () => void }) {
 
 // --- Header ---
 
-function Header({ query, onQuery, onLogout, authRequired }: {
-  query: string; onQuery: (q: string) => void; onLogout: () => void; authRequired: boolean
+function Header({ query, onQuery, onLogout, authRequired, showSearch }: {
+  query: string; onQuery: (q: string) => void; onLogout: () => void; authRequired: boolean; showSearch: boolean
 }) {
   const { t } = useTranslation()
   const inputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
+    if (!showSearch) return
     const handler = (e: KeyboardEvent) => {
       if (e.key === '/') {
         // Don't hijack "/" when the user is already typing in another
@@ -265,10 +319,10 @@ function Header({ query, onQuery, onLogout, authRequired }: {
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [])
+  }, [showSearch])
 
   return (
-    <header className="sticky top-0 z-50 flex items-center justify-between px-6 py-2.5 border-b border-border bg-bg-secondary/80 backdrop-blur-xl">
+    <header className="sticky top-0 z-50 flex flex-wrap gap-3 items-center justify-between px-4 py-2.5 border-b border-border bg-bg-secondary/80 backdrop-blur-xl">
       <div className="flex items-center gap-2.5">
         <div className="w-7 h-7 bg-[#333] rounded-md flex items-center justify-center text-sm font-extrabold text-white">N</div>
         <span className="text-[15px] font-semibold tracking-tight">
@@ -277,7 +331,7 @@ function Header({ query, onQuery, onLogout, authRequired }: {
         </span>
       </div>
       <div className="flex items-center gap-3">
-        <div className="relative w-72">
+        <div className={`relative w-72 max-sm:w-40 ${showSearch ? '' : 'hidden'}`}>
           <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-text-muted" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" />
           </svg>
@@ -319,7 +373,8 @@ function StatCard({ label, value, sub, color, icon }: { label: string; value: st
 }
 
 function hasPremiumAccess(account: AccountInfo): boolean {
-  return !!account.has_premium || (account.premium_limit || 0) > 0 || (account.premium_balance || 0) > 0
+  const balance = confirmedPremiumBalance(account.premium_balance, account.premium_balance_known)
+  return !!account.has_premium || (account.premium_limit || 0) > 0 || (balance !== null && balance > 0)
 }
 
 function getSpaceQuota(account: AccountInfo) {
@@ -381,8 +436,7 @@ function TotalQuotaBar({ summary }: { summary?: AccountSummary | null }) {
   const totalSpaceLimit = summary?.total_space_limit ?? 0
   const totalUserUsage = summary?.total_user_usage ?? 0
   const totalUserLimit = summary?.total_user_limit ?? 0
-  const totalPremiumBalance = summary?.total_premium_balance ?? 0
-  const totalPremiumLimit = summary?.total_premium_limit ?? 0
+  const totalPremiumBalance = confirmedPremiumBalance(summary?.total_premium_balance, summary?.premium_unknown_accounts != null)
   const sameBasicQuota = isSameQuota(
     { usage: totalSpaceUsage, limit: totalSpaceLimit },
     { usage: totalUserUsage, limit: totalUserLimit },
@@ -390,14 +444,15 @@ function TotalQuotaBar({ summary }: { summary?: AccountSummary | null }) {
 
   return (
     <div className="mb-5 space-y-3">
-      <div className="flex justify-between items-center">
+      <div className="flex flex-wrap gap-3 justify-between items-center">
         <span className="text-[11px] text-text-secondary uppercase tracking-wider flex items-center gap-1.5"><IconBarChart /> {t('stats.basic_overview')}</span>
-        {totalPremiumLimit > 0 && (
+        {summary && (
           <span className="text-[12px] text-text-muted tabular-nums">
-            {t('stats.premium_remaining')} <span className="text-[#7eb8ff] font-semibold">{fmt(totalPremiumBalance)}</span> / {fmt(totalPremiumLimit)}
+            {t('quota.known_premium_summary', { balance: metricValue(totalPremiumBalance), count: metricValue(summary.premium_unknown_accounts) })}
           </span>
         )}
       </div>
+      <p className="text-[11px] text-text-secondary">{t('quota.compatibility_note')}</p>
       {sameBasicQuota ? (
         <OverviewBar label="Basic" usage={totalSpaceUsage} limit={totalSpaceLimit} />
       ) : (
@@ -420,6 +475,7 @@ function AIUsage({ account }: { account: AccountInfo }) {
   return (
     <section className="my-3 rounded-md border border-border bg-bg-card p-3" aria-label={t('ai_usage.title')}>
       <div className="text-[12px] font-semibold mb-2">{t('ai_usage.title')}</div>
+      {account.rate_limit_error && <p role="status" className="text-[11px] text-warn mb-2">{t('quota.rate_read_failed')}</p>}
       {!rate && <p className="text-[11px] text-text-secondary">{t('ai_usage.unavailable')}</p>}
       {windows.map(w => w.limit > 0 ? (
         <div key={w.label} className="mb-2 text-[11px]">
@@ -474,13 +530,15 @@ function Badge({ children, variant }: { children: React.ReactNode; variant: 'pla
   )
 }
 
-function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: () => void }) {
+function AccountCard({ account, onChanged, routing, onToggle, toggling }: { account: AccountInfo; onChanged: () => void; routing?: RoutingMember; onToggle: (member: RoutingMember) => Promise<void>; toggling: boolean }) {
   const { t } = useTranslation()
+  const [workspaceCopy, setWorkspaceCopy] = useState<'idle' | 'copied' | 'failed'>('idle')
   const [showModels, setShowModels] = useState(false)
   const spaceQuota = getSpaceQuota(account)
   const userQuota = getUserQuota(account)
   const sameBasicQuota = isSameQuota(spaceQuota, userQuota)
   const premium = hasPremiumAccess(account)
+  const premiumBalance = confirmedPremiumBalance(account.premium_balance, account.premium_balance_known)
   const researchLimited = isResearchLimited(account)
   const noWorkspace = !!account.no_workspace
   // Availability is determined by backend eligible/exhausted flags,
@@ -541,12 +599,31 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
       </div>
 
       {/* Badges */}
+      {account.space_id && <div className="flex items-center gap-2 text-[11px] text-text-secondary mb-2">
+        <span>{t('account.workspace_id')}</span>
+        <code className="truncate select-all" title={account.space_id}>{account.space_id}</code>
+        <button className="shrink-0 text-notion-blue cursor-pointer" aria-label={`${t('account.copy_workspace_id')} ${account.space_id}`}
+          onClick={async event => {
+            event.stopPropagation()
+            try { await navigator.clipboard.writeText(account.space_id!); setWorkspaceCopy('copied') }
+            catch { setWorkspaceCopy('failed') }
+          }}>{workspaceCopy === 'copied' ? t('api.copied') : t('account.copy_workspace_id')}</button>
+      </div>}
+      {workspaceCopy === 'failed' && <p role="alert" className="text-err text-[11px]">{t('models.copy_failed')}</p>}
+      {routing && <div className="rounded-md border border-border p-2 mb-2 text-[11px] text-text-secondary space-y-1">
+        <div className="flex items-center justify-between gap-2"><span>{t(`upgrade.member_${routing.status}`)} · {t('upgrade.in_flight')}: {routing.in_flight}</span><button className="text-notion-blue cursor-pointer disabled:opacity-40" disabled={toggling} onClick={event => { event.stopPropagation(); void onToggle(routing) }}>{t(routing.enabled ? 'upgrade.pause' : 'upgrade.enable')}</button></div>
+        {routing.reason && <p className="break-words">{t(`upgrade.reason_${routing.reason}`, { defaultValue: routing.reason })}</p>}
+        <p>{t('upgrade.score_source')}: {t(`upgrade.score_${routing.score_source}`, { defaultValue: routing.score_source })}</p>
+        <p>{t('upgrade.checked')}: {timestampValue(routing.quota_checked_at_ms)}</p>
+        {routing.cooldown_until_ms && <p>{t('upgrade.recovery')}: {timestampValue(routing.cooldown_until_ms)}</p>}
+      </div>}
       <div className="flex gap-3 flex-wrap mt-3 mb-2.5 items-center">
         <Badge variant="plan">{account.plan || 'unknown'}</Badge>
+        <Badge variant={account.subscription_status === 'verified_business' ? 'plan' : 'warning'}>{t(account.subscription_status === 'verified_business' ? 'upgrade.verified_business' : 'upgrade.legacy_unverified')}</Badge>
         {account.registered_via && (
           <Badge variant="plan">via {providerDisplay(account.registered_via)}</Badge>
         )}
-        {premium && <Badge variant="premium">AI Premium</Badge>}
+        {premium && <Badge variant="premium">{t('quota.premium_metrics')}</Badge>}
         {(account.research_usage != null && account.research_usage > 0) && (
           <Badge variant={researchLimited ? 'warning' : 'research'}>
             <IconFlask /> Research {t('account.used', { count: account.research_usage })}{premium ? '' : '/3'}
@@ -567,6 +644,8 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
 
       {/* Quotas */}
       <AIUsage account={account} />
+      <p className="text-[10px] text-text-secondary mb-2">{t('quota.compatibility_note')}</p>
+      {account.quota_status_reason && <p role="status" className="text-[11px] text-warn mb-2">{t(`quota.${account.quota_status_reason}`)}</p>}
       {sameBasicQuota ? (
         <QuotaBar label="Basic" usage={spaceQuota.usage} limit={spaceQuota.limit} />
       ) : (
@@ -578,7 +657,7 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
       {premium && <QuotaBar label="Premium" labelClass="text-[#7eb8ff]" usage={account.premium_usage} limit={account.premium_limit} />}
       <div className="flex flex-wrap gap-3 mt-2 text-[10px] text-text-muted">
         <span>{t('account.basic_remaining')} {fmt(account.remaining || 0)}</span>
-        {premium && <span>{t('account.premium_remaining')} {fmt(account.premium_balance || 0)}</span>}
+        {premium && <span>{t('account.premium_remaining')} {premiumBalance === null ? t('quota.unknown') : metricValue(premiumBalance)}</span>}
       </div>
 
       {/* Models (expandable) */}
@@ -601,7 +680,7 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
         {noWorkspace ? (
           <span className="text-[11px] text-err font-medium">{t('account.unavailable')}</span>
         ) : (
-          <span className="text-[11px] text-text-secondary hover:text-white font-medium transition-colors">{t('account.open_proxy')}</span>
+          <button className="text-[11px] text-text-secondary hover:text-white font-medium transition-colors cursor-pointer" onClick={event => { event.stopPropagation(); handleClick() }}>{t('account.open_proxy')}</button>
         )}
       </div>
     </div>
@@ -612,281 +691,197 @@ export default function App() {
   const { t, i18n } = useTranslation()
   const [authState, setAuthState] = useState<'checking' | 'login' | 'authenticated'>('checking')
   const [authRequired, setAuthRequired] = useState(false)
+  const [authError, setAuthError] = useState('')
+  const [authVersion, setAuthVersion] = useState(0)
+  const [importVersion, setImportVersion] = useState(0)
+  const [routingVersion, setRoutingVersion] = useState(0)
+  const [activeTab, setActiveTab] = useState<DashboardTab>(() => dashboardTab(window.location.hash))
   const [data, setData] = useState<DashboardData | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [quotaRefreshing, setQuotaRefreshing] = useState(false)
   const [refreshStatus, setRefreshStatus] = useState<RefreshStatus | null>(null)
   const [query, setQuery] = useState('')
+  const [debouncedQuery, setDebouncedQuery] = useState('')
   const [refreshTime, setRefreshTime] = useState('')
   const [page, setPage] = useState(0)
-  const [settings, setSettings] = useState<SearchSettings | null>(null)
   const [tokenStats, setTokenStats] = useState<TokenStats | null>(null)
-  const [apiKeyRevealed, setApiKeyRevealed] = useState(false)
-  const [registerOpen, setRegisterOpen] = useState(false)
-  const [historyOpen, setHistoryOpen] = useState(false)
-  const [copiedField, setCopiedField] = useState<'key' | 'base' | null>(null)
+  const [routing, setRouting] = useState<RoutingData | null>(null)
+  const [routingError, setRoutingError] = useState('')
+  const [memberSaving, setMemberSaving] = useState('')
   const [showAddModal, setShowAddModal] = useState(false)
-  const [activeTab, setActiveTab] = useState<'accounts' | 'models'>('accounts')
-  const copyToClipboard = (text: string, field: 'key' | 'base') => {
-    navigator.clipboard.writeText(text)
-    setCopiedField(field)
-    setTimeout(() => setCopiedField(null), 1000)
-  }
-  // Local draft for the global Notion proxy input. Kept separate from
-  // settings.notion_proxy so the user can type without each keystroke
-  // hitting the API; we commit on blur/Enter and roll back on error.
-  const [proxyDraft, setProxyDraft] = useState('')
-  const [proxyError, setProxyError] = useState<string | null>(null)
-  const [proxySaving, setProxySaving] = useState(false)
+  const accountRequest = useRef<AbortController | null>(null)
+  const quotaRefreshPending = useRef(false)
   const PAGE_SIZE = 20
 
-  // Debounced query: typing in the search box shouldn't fire a request
-  // on every keystroke; we wait 250ms after the user stops typing and
-  // only then re-fetch. The debounced value is what actually goes to
-  // the server.
-  const [debouncedQuery, setDebouncedQuery] = useState('')
   useEffect(() => {
-    const handle = setTimeout(() => setDebouncedQuery(query.trim()), 250)
-    return () => clearTimeout(handle)
-  }, [query])
-
-  // Check auth on mount
-  useEffect(() => {
-    checkAuth().then(status => {
-      setAuthRequired(status.required)
-      if (!status.required || status.authenticated) {
-        setAuthState('authenticated')
-      } else {
-        setAuthState('login')
-        setLoading(false)
-      }
-    }).catch(() => {
-      setAuthState('authenticated') // fallback: skip auth
-    })
+    const change = () => { setActiveTab(dashboardTab(window.location.hash)); setShowAddModal(false) }
+    window.addEventListener('hashchange', change)
+    return () => window.removeEventListener('hashchange', change)
   }, [])
 
-  // loadData fetches the *paginated* account list using the current
-  // page + debounced query. The server filters/sorts/slices for us, so
-  // `data.accounts` is already the visible page.
-  const loadData = useCallback(async () => {
-    try {
-      const d = await fetchDashboardData({ page, pageSize: PAGE_SIZE, query: debouncedQuery })
-      setData(d)
-      setError(null)
-      const dateLocale = i18n.language === 'zh' ? 'zh-CN' : 'en-US'
-      setRefreshTime(new Date().toLocaleTimeString(dateLocale))
-      if (d.refresh) {
-        setRefreshStatus(d.refresh)
-      }
-    } catch (e: any) {
-      setError(e.message || 'Unknown error')
-    } finally {
-      setLoading(false)
+  useEffect(() => {
+    let live = true
+    setAuthState('checking'); setAuthError('')
+    const controller = new AbortController()
+    checkAuth(controller.signal).then(status => {
+      if (!live) return
+      setAuthRequired(status.required)
+      setAuthState(!status.required || status.authenticated ? 'authenticated' : 'login')
+    }).catch(reason => { if (live) setAuthError(reason instanceof Error ? reason.message : String(reason)) })
+    return () => { live = false; controller.abort() }
+  }, [authVersion])
+
+  useEffect(() => {
+    const expired = () => {
+      accountRequest.current?.abort()
+      setAuthState(authRequired ? 'login' : 'checking'); setData(null); setRouting(null); setTokenStats(null); setShowAddModal(false)
+      if (!authRequired) setAuthVersion(value => value + 1)
     }
+    window.addEventListener('notion-manager-unauthorized', expired)
+    const imported = () => setImportVersion(value => value + 1)
+    window.addEventListener('notion-manager-account-imported', imported)
+    return () => { window.removeEventListener('notion-manager-unauthorized', expired); window.removeEventListener('notion-manager-account-imported', imported) }
+  }, [authRequired])
+
+  useEffect(() => {
+    const timer = setTimeout(() => { setDebouncedQuery(query.trim()); setPage(0) }, 250)
+    return () => clearTimeout(timer)
+  }, [query])
+
+  const loadData = useCallback(async () => {
+    accountRequest.current?.abort()
+    const controller = new AbortController()
+    accountRequest.current = controller
+    setLoading(true)
+    try {
+      const result = await fetchDashboardData({ page, pageSize: PAGE_SIZE, query: debouncedQuery }, controller.signal)
+      if (controller.signal.aborted) return
+      setData(result); setError('')
+      setRefreshStatus(result.refresh || null)
+      setRefreshTime(new Date().toLocaleTimeString(i18n.language === 'zh' ? 'zh-CN' : 'en-US'))
+    } catch (reason) {
+      if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : String(reason))
+    } finally { if (!controller.signal.aborted) setLoading(false) }
   }, [page, debouncedQuery, i18n.language])
 
   useEffect(() => {
-    if (authState === 'authenticated') loadData()
-  }, [authState, loadData])
+    if (authState !== 'authenticated' || activeTab !== 'accounts') return
+    void loadData()
+    return () => { accountRequest.current?.abort() }
+  }, [authState, activeTab, loadData, importVersion])
 
-  // Settings + token stats are pool-wide and don't change with the
-  // current page/query, so we only fetch them on auth — not on every
-  // page navigation.
   useEffect(() => {
-    if (authState !== 'authenticated') return
-    fetchSettings()
-      .then(s => {
-        setSettings(s)
-        setProxyDraft(s.notion_proxy ?? '')
-      })
-      .catch(() => {})
-    fetchTokenStats().then(setTokenStats).catch(() => {})
-  }, [authState])
+    if (authState !== 'authenticated' || activeTab !== 'accounts') return
+    const controller = new AbortController()
+    setTokenStats(null)
+    fetchTokenStats(controller.signal).then(value => { if (!controller.signal.aborted) setTokenStats(value) }).catch(() => {})
+    fetchRouting(controller.signal).then(value => { if (!controller.signal.aborted) { setRouting(value); setRoutingError('') } }).catch(reason => {
+      if (!controller.signal.aborted) setRoutingError(reason instanceof Error ? reason.message : String(reason))
+    })
+    return () => controller.abort()
+  }, [authState, activeTab, importVersion, routingVersion])
 
-  const handleLogout = async () => {
-    await logout()
-    setAuthState('login')
-    setData(null)
-  }
+  useEffect(() => {
+    if (authState !== 'authenticated' || activeTab !== 'accounts') {
+      quotaRefreshPending.current = false
+      return
+    }
+    const next = quotaRefreshProgress(quotaRefreshPending.current, refreshStatus?.refreshing)
+    quotaRefreshPending.current = next.pending
+    if (next.completed) setRoutingVersion(value => value + 1)
+  }, [authState, activeTab, refreshStatus])
 
-  const refresh = async () => {
-    setRefreshing(true)
-    await loadData()
-    setRefreshing(false)
-  }
+  useEffect(() => {
+    if (authState !== 'authenticated' || activeTab !== 'accounts' || !refreshStatus?.refreshing) return
+    const interval = setInterval(() => { void loadData() }, 3000)
+    return () => clearInterval(interval)
+  }, [authState, activeTab, refreshStatus?.refreshing, loadData])
 
+  const refresh = async () => { setRefreshing(true); setRoutingVersion(value => value + 1); await loadData(); setRefreshing(false) }
   const handleQuotaRefresh = async () => {
     setQuotaRefreshing(true)
     try {
       await triggerRefresh()
-      // Start polling immediately
-      setRefreshStatus(prev => prev ? { ...prev, refreshing: true, done: 0 } : { refreshing: true, done: 0, total: 0 })
-    } catch { /* ignore */ }
-    setQuotaRefreshing(false)
+      quotaRefreshPending.current = true
+      setRefreshStatus(previous => ({ refreshing: true, done: 0, total: previous?.total || 0 }))
+    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
+    finally { setQuotaRefreshing(false) }
   }
-
-  const toggleSetting = async (key: 'enable_web_search' | 'enable_workspace_search' | 'ask_mode_default' | 'debug_logging') => {
-    if (!settings) return
-    const newVal = !settings[key]
+  const toggleMember = async (member: RoutingMember) => {
+    setMemberSaving(member.account_id); setRoutingError('')
     try {
-      const updated = await updateSettings({ [key]: newVal })
-      setSettings(updated)
-    } catch { /* ignore */ }
+      const latest = await fetchRouting()
+      const disabled = new Set(latest.disabled_account_ids)
+      if (member.enabled) disabled.add(member.account_id)
+      else disabled.delete(member.account_id)
+      setRouting(await updateRouting({
+        mode: latest.mode, max_attempts: latest.max_attempts,
+        max_concurrent_per_account: latest.max_concurrent_per_account,
+        retention_days: latest.retention_days, disabled_account_ids: [...disabled],
+      }))
+    } catch (reason) { setRoutingError(reason instanceof Error ? reason.message : String(reason)) }
+    finally { setMemberSaving('') }
   }
-
-  // saveProxy commits the proxy input draft. We skip the round trip when
-  // the value is unchanged (typical blur after focus). Backend rejects
-  // unsupported schemes with HTTP 400 + JSON error; we surface the
-  // message inline and roll the input back to the persisted value so a
-  // typo doesn't get silently saved.
-  const saveProxy = async () => {
-    if (!settings) return
-    const next = proxyDraft.trim()
-    if (next === (settings.notion_proxy ?? '').trim()) {
-      setProxyDraft(settings.notion_proxy ?? '')
-      setProxyError(null)
-      return
-    }
-    setProxySaving(true)
-    setProxyError(null)
+  const handleLogout = async () => {
     try {
-      const updated = await updateSettings({ notion_proxy: next })
-      setSettings(updated)
-      setProxyDraft(updated.notion_proxy ?? '')
-    } catch (e: any) {
-      setProxyError(e?.message || t('api.save_failed'))
-      setProxyDraft(settings.notion_proxy ?? '')
-    } finally {
-      setProxySaving(false)
-    }
+      await logout()
+      accountRequest.current?.abort()
+      setAuthState('login'); setData(null); setTokenStats(null); setRouting(null); setShowAddModal(false)
+    } catch (reason) { setAuthError(reason instanceof Error ? reason.message : String(reason)) }
   }
 
-  // Auto-poll when backend is refreshing quotas
-  useEffect(() => {
-    if (!refreshStatus?.refreshing) return
-    const interval = setInterval(async () => {
-      await loadData()
-    }, 3000)
-    return () => clearInterval(interval)
-  }, [refreshStatus?.refreshing, loadData])
-
-  // Server-paginated: data.accounts is already the visible page slice
-  // (filtered + sorted server-side). filtered_total tells us how many
-  // entries match the current query across the whole pool, which is
-  // what we need to render pagination controls.
   const accounts = data?.accounts || []
   const paged = accounts
   const filteredTotal = data?.filtered_total ?? data?.total ?? accounts.length
   const totalPages = Math.max(1, Math.ceil(filteredTotal / PAGE_SIZE))
-
-  // Reset page when the (debounced) query changes so the user always
-  // lands on the first page of new search results.
-  useEffect(() => { setPage(0) }, [debouncedQuery])
-  // Clamp `page` if the result set shrank below the current page.
-  useEffect(() => {
-    if (page > 0 && page >= totalPages) setPage(Math.max(0, totalPages - 1))
-  }, [page, totalPages])
-
+  useEffect(() => { if (page >= totalPages) setPage(Math.max(0, totalPages - 1)) }, [page, totalPages])
   const summary = useMemo(() => {
     if (!data) return null
     const s = data.summary
-    // Note: backend's AvailableCount already excludes no_workspace, so
-    // (total - available) lumps "exhausted" and "no workspace" together.
-    // We split them out explicitly for the operator.
-    const exhausted = data.total - data.available
-    const availableRate = data.total > 0 ? Math.round((data.available / data.total) * 100) : 0
-    const sameBasicQuota = isSameQuota(
-      { usage: s?.total_space_usage ?? 0, limit: s?.total_space_limit ?? 0 },
-      { usage: s?.total_user_usage ?? 0, limit: s?.total_user_limit ?? 0 },
-    )
     return {
-      exhausted,
-      exhaustedOnly: s?.exhausted_only ?? 0,
-      noWorkspace: s?.no_workspace ?? 0,
-      availableRate,
-      totalResearchUsage: s?.total_research_usage ?? 0,
-      totalRemaining: s?.total_remaining ?? 0,
-      totalSpaceRemaining: s?.total_space_remaining ?? 0,
-      totalUserRemaining: s?.total_user_remaining ?? 0,
-      totalPremiumBalance: s?.total_premium_balance ?? 0,
-      totalPremiumLimit: s?.total_premium_limit ?? 0,
-      premiumAccounts: s?.premium_accounts ?? 0,
-      researchLimited: s?.research_limited ?? 0,
-      sameBasicQuota,
+      ...routingMetrics(routing, s?.exhausted_only),
+      noWorkspace: s?.no_workspace,
+      totalResearchUsage: s?.total_research_usage ?? 0, totalRemaining: s?.total_remaining ?? 0,
+      totalSpaceRemaining: s?.total_space_remaining ?? 0, totalUserRemaining: s?.total_user_remaining ?? 0,
+      totalPremiumBalance: confirmedPremiumBalance(s?.total_premium_balance, s?.premium_unknown_accounts != null), totalPremiumLimit: s?.total_premium_limit ?? 0,
+      premiumUnknownAccounts: s?.premium_unknown_accounts,
+      premiumAccounts: s?.premium_accounts ?? 0, researchLimited: s?.research_limited ?? 0,
+      sameBasicQuota: isSameQuota({ usage: s?.total_space_usage ?? 0, limit: s?.total_space_limit ?? 0 }, { usage: s?.total_user_usage ?? 0, limit: s?.total_user_limit ?? 0 }),
     }
-  }, [data])
-
-  // Auth checking spinner
-  if (authState === 'checking') {
-    return (
-      <div className="flex items-center justify-center h-screen gap-3 text-text-secondary text-sm">
-        <div className="w-4 h-4 border-2 border-border border-t-notion-blue rounded-full animate-spin" />
-      </div>
-    )
-  }
-
-  // Login page
-  if (authState === 'login') {
-    return <LoginPage onSuccess={() => { setAuthState('authenticated'); setLoading(true) }} />
-  }
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center h-screen gap-3 text-text-secondary text-sm">
-        <div className="w-4 h-4 border-2 border-border border-t-notion-blue rounded-full animate-spin" />
-        {t('common.loading_accounts')}
-      </div>
-    )
-  }
-
-  if (error && !data) {
-    return (
-      <div className="flex items-center justify-center h-screen text-err text-sm">
-        {t('common.load_failed', { error })}
-      </div>
-    )
-  }
-
+  }, [data, routing])
+  if (authState === 'checking') return <div className="max-w-lg mx-auto p-8"><ResourceState loading={!authError} error={authError} retry={() => setAuthVersion(value => value + 1)} /></div>
+  if (authState === 'login') return <LoginPage onSuccess={() => { setAuthState('authenticated'); setLoading(true) }} />
   const dateLocale = i18n.language === 'zh' ? 'zh-CN' : 'en-US'
 
-  return (
-    <div className="min-h-screen">
-      <Header query={query} onQuery={setQuery} onLogout={handleLogout} authRequired={authRequired} />
-
-      <main className="max-w-[1280px] mx-auto px-6 py-6">
-        <div role="tablist" aria-label={t('models.navigation')} className="flex gap-2 border-b border-border pb-3 mb-5">
-          {(['accounts', 'models'] as const).map(tab => (
-            <button key={tab} id={`tab-${tab}`} role="tab" aria-selected={activeTab === tab} aria-controls={`panel-${tab}`} tabIndex={activeTab === tab ? 0 : -1}
-              onClick={() => setActiveTab(tab)}
-              onKeyDown={event => {
-                if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
-                  event.preventDefault()
-                  const next = event.key === 'Home' ? 'accounts' : event.key === 'End' ? 'models' : tab === 'accounts' ? 'models' : 'accounts'
-                  setActiveTab(next)
-                  document.getElementById(`tab-${next}`)?.focus()
-                }
-              }}
-              className={`rounded-md px-4 py-2 text-[13px] border border-border cursor-pointer ${activeTab === tab ? 'bg-notion-blue text-white' : 'bg-bg-card text-text-secondary hover:bg-bg-card-hover'}`}>
-              {t(`models.tab_${tab}`)}
-            </button>
-          ))}
-        </div>
-        {activeTab === 'models' && <div role="tabpanel" id="panel-models" aria-labelledby="tab-models"><ModelsPanel /></div>}
-        <div role="tabpanel" id="panel-accounts" aria-labelledby="tab-accounts" hidden={activeTab !== 'accounts'}>
+  return <div className="min-h-screen">
+    <Header query={query} onQuery={setQuery} onLogout={handleLogout} authRequired={authRequired} showSearch={activeTab === 'accounts'} />
+    <main className="max-w-[1280px] mx-auto px-4 sm:px-6 py-6">
+      <nav aria-label={t('upgrade.navigation')} className="flex flex-wrap gap-2 border-b border-border pb-3 mb-5">
+        {dashboardTabs.map(tab => <a key={tab} href={`#${tab}`} aria-current={activeTab === tab ? 'page' : undefined} className={`${buttonClass} ${activeTab === tab ? 'bg-notion-blue! text-white' : 'text-text-secondary'}`}>{t(`upgrade.${tab}`)}</a>)}
+      </nav>
+      {authError && <p role="alert" className="text-err text-sm mb-4">{authError}</p>}
+      {activeTab === 'overview' && <OverviewPanel key={importVersion} />}
+      {activeTab === 'models' && <ModelsPanel key={importVersion} />}
+      {activeTab === 'logs' && <LogsPanel />}
+      {activeTab === 'analytics' && <AnalyticsPanel />}
+      {activeTab === 'settings' && <SettingsPanel />}
+      {activeTab === 'accounts' && <section aria-label={t('upgrade.accounts')}>
+        <h1 className="text-xl font-semibold mb-4">{t('upgrade.accounts')}</h1>
+        <ResourceState loading={loading && !data} error={error} retry={() => { void loadData() }} />
+        {routingError && <p role="alert" className="text-err text-sm mb-4 break-words">{routingError}</p>}
+        {routing && <div className="text-[12px] text-text-secondary border border-border rounded-lg p-3 mb-4">{t('upgrade.pool_summary', routing as unknown as Record<string, unknown>)} · {t(`upgrade.mode_${routing.mode}`)}</div>}
         {/* Summary */}
         {summary && (
           <div className="grid grid-cols-5 divide-x divide-white/[.05] mb-6 max-lg:grid-cols-3 max-md:grid-cols-2 max-md:divide-x-0 max-sm:grid-cols-1">
             <StatCard
               label={t('stats.total_accounts')} value={data!.total}
-              sub={summary.noWorkspace > 0
-                ? t('stats.available_spent_no_workspace', { available: data!.available, spent: summary.exhaustedOnly, noWorkspace: summary.noWorkspace })
-                : t('stats.available_spent_no_workspace', { available: data!.available, spent: summary.exhausted, noWorkspace: 0 })}
+              sub={t('stats.available_spent_no_workspace', { available: metricValue(summary.available), spent: metricValue(summary.exhausted), noWorkspace: metricValue(summary.noWorkspace) })}
             />
             <StatCard
-              label={t('stats.available')} value={data!.available}
-              sub={t('stats.ratio', { percent: summary.availableRate })}
+              label={`${t('upgrade.pool')} · ${t('stats.available')}`} value={metricValue(summary.available)}
+              sub={summary.availableRate === null ? '—' : t('stats.ratio', { percent: summary.availableRate })}
               color="var(--color-ok)"
             />
             <StatCard
@@ -896,16 +891,16 @@ export default function App() {
                 : `Space ${fmt(summary.totalSpaceRemaining)} · User ${fmt(summary.totalUserRemaining)}`}
             />
             <StatCard
-              label={t('stats.premium_remaining')} value={fmt(summary.totalPremiumBalance)}
-              sub={summary.totalPremiumLimit > 0
+              label={t('stats.premium_remaining')} value={metricValue(summary.totalPremiumBalance)}
+              sub={t('quota.unknown_accounts', { count: metricValue(summary.premiumUnknownAccounts) }) + ' · ' + (summary.totalPremiumLimit > 0
                 ? t('stats.premium_accounts_count', { count: summary.premiumAccounts, usage: summary.totalResearchUsage })
-                : t('stats.no_premium_credits', { limit: summary.researchLimited })}
+                : t('stats.no_premium_credits', { limit: summary.researchLimited }))}
               color="var(--color-research, #9b51e0)"
             />
             <StatCard
               icon={<IconActivity />}
               label={t('stats.token_usage')}
-              value={formatTokens(tokenStats?.total.total ?? 0)}
+              value={tokenStats ? formatTokens(tokenStats.total.total) : '—'}
               sub={tokenStats
                 ? t('stats.today_usage', { today: formatTokens(tokenStats.today.total), input: formatTokens(tokenStats.today.input), output: formatTokens(tokenStats.today.output) })
                 : t('stats.no_usage')}
@@ -915,214 +910,37 @@ export default function App() {
         )}
 
         {/* Total Quota Bar */}
-        <TotalQuotaBar summary={data?.summary} />
+        {data && <TotalQuotaBar summary={data.summary} />}
         {data?.accounts.length === 1 && <AIUsage account={data.accounts[0]} />}
 
-        {/* Refresh Status Banner */}
-        {refreshStatus?.refreshing && (
-          <div className="bg-notion-blue/10 border border-notion-blue/20 rounded-lg p-3 mb-5 flex items-center gap-3">
-            <div className="w-4 h-4 border-2 border-notion-blue/30 border-t-notion-blue rounded-full animate-spin shrink-0" />
-            <div className="flex-1 min-w-0">
-              <div className="text-[13px] font-medium text-[#5c9ce6]">
-                {t('common.status_refreshing', { current: refreshStatus.done, total: refreshStatus.total })}
-              </div>
-              <div className="h-1.5 bg-white/[.06] rounded-full overflow-hidden mt-1.5">
-                <div
-                  className="h-full bg-notion-blue rounded-full transition-all duration-500"
-                  style={{ width: `${refreshStatus.total > 0 ? (refreshStatus.done / refreshStatus.total) * 100 : 0}%` }}
-                />
-              </div>
-            </div>
-          </div>
-        )}
 
-        {/* Actions */}
-        <div className="flex items-center gap-2.5 mb-5 flex-wrap">
-          <button
-            onClick={openBestProxy}
-            className="inline-flex items-center gap-1.5 px-4 py-2 bg-white hover:bg-white/90 text-[#111] rounded-md text-[13px] font-medium cursor-pointer transition-colors border-none"
-          >
-            <IconZap /> {t('actions.open_best_account')}
-          </button>
-          <button
-            onClick={handleQuotaRefresh}
-            disabled={quotaRefreshing || refreshStatus?.refreshing}
-            className={`inline-flex items-center gap-1.5 px-4 py-2 bg-bg-card hover:bg-bg-card-hover text-text-primary rounded-md text-[13px] font-medium cursor-pointer transition-colors border border-border disabled:opacity-50 disabled:cursor-not-allowed ${refreshStatus?.refreshing ? 'animate-pulse' : ''}`}
-          >
-            <IconRefresh /> {t('actions.refresh_quota')}
-          </button>
-          <button
-            onClick={refresh}
-            disabled={refreshing}
-            className={`inline-flex items-center gap-1.5 px-4 py-2 bg-bg-card hover:bg-bg-card-hover text-text-primary rounded-md text-[13px] font-medium cursor-pointer transition-colors border border-border disabled:opacity-50 disabled:cursor-not-allowed ${refreshing ? 'animate-pulse' : ''}`}
-          >
-            <IconRefresh /> {t('actions.refresh_data')}
-          </button>
-          <button
-            onClick={() => setShowAddModal(true)}
-            className="inline-flex items-center gap-1.5 px-4 py-2 bg-bg-card hover:bg-bg-card-hover text-text-primary rounded-md text-[13px] font-medium cursor-pointer transition-colors border border-border"
-          >
-            <IconPlus /> {t('actions.add_account')}
-          </button>
-          <button
-            onClick={() => setRegisterOpen(true)}
-            className="inline-flex items-center gap-1.5 px-4 py-2 bg-bg-card hover:bg-bg-card-hover text-text-primary rounded-md text-[13px] font-medium cursor-pointer transition-colors border border-border"
-          >
-            <IconUserPlus size={13} /> {t('actions.register_account')}
-          </button>
-          <button
-            onClick={() => setHistoryOpen(true)}
-            className="inline-flex items-center gap-1.5 px-4 py-2 bg-bg-card hover:bg-bg-card-hover text-text-primary rounded-md text-[13px] font-medium cursor-pointer transition-colors border border-border"
-          >
-            <IconHistory size={13} /> {t('actions.history_tasks')}
-          </button>
-          {refreshTime && (
-            <span className="text-[11px] text-text-muted">
-              {t('actions.updated_at', { time: refreshTime })}
-              {refreshStatus?.last_refresh_at && !refreshStatus.refreshing && (
-                <> · {t('actions.quota_refreshed_at', { time: new Date(refreshStatus.last_refresh_at).toLocaleTimeString(dateLocale) })}</>
-              )}
-            </span>
-          )}
+        {refreshStatus?.refreshing && <p role="status" className="text-notion-blue text-sm mb-3">{t('common.status_refreshing', { current: refreshStatus.done, total: refreshStatus.total })}</p>}
+        <div className="flex flex-wrap gap-2 mb-4">
+          <button className={buttonClass} onClick={openBestProxy}><IconZap /> {t('actions.open_best_account')}</button>
+          <button className={buttonClass} disabled={quotaRefreshing || refreshStatus?.refreshing} onClick={handleQuotaRefresh}>{t('actions.refresh_quota')}</button>
+          <button className={buttonClass} disabled={refreshing} onClick={refresh}>{t('actions.refresh_data')}</button>
+          <button className={buttonClass} onClick={() => setShowAddModal(true)}>{t('actions.add_account')}</button>
+          {refreshTime && <span className="text-[11px] text-text-secondary self-center">{t('actions.updated_at', { time: refreshTime })}{refreshStatus?.last_refresh_at && <> · {t('actions.quota_refreshed_at', { time: new Date(refreshStatus.last_refresh_at).toLocaleTimeString(dateLocale) })}</>}</span>}
         </div>
-
-        {/* API Settings */}
-        {settings && (() => {
-          const apiKey = document.querySelector('meta[name="api-key"]')?.getAttribute('content') || ''
-          const apiBase = `${window.location.origin}/v1`
-          const maskedKey = apiKey ? apiKey.slice(0, 5) + '•'.repeat(Math.max(0, apiKey.length - 9)) + apiKey.slice(-4) : ''
-          return (
-            <div className="mb-6 px-4 py-3 bg-[#171717] border border-white/5 rounded-lg shadow-inner">
-              <div className="flex items-center gap-6 flex-wrap">
-                <span className="text-[12px] text-text-secondary font-medium flex items-center gap-2 shrink-0">
-                  <IconSettings /> {t('api.settings_title')}
-                </span>
-                <div className="flex items-center gap-6 flex-wrap">
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-[11px] text-text-muted">API Key</span>
-                    <code
-                      className={`text-[11px] bg-white/[.05] px-1.5 py-0.5 rounded cursor-pointer hover:bg-white/[.1] transition-colors font-mono ${copiedField === 'key' ? 'text-ok' : 'text-text-primary'}`}
-                      onClick={() => copyToClipboard(apiKey, 'key')}
-                      title={t('api.click_to_copy')}
-                    >
-                      {copiedField === 'key' ? `✓ ${t('api.copied')}` : (apiKeyRevealed ? apiKey : maskedKey)}
-                    </code>
-                    <button
-                      onClick={() => setApiKeyRevealed(!apiKeyRevealed)}
-                      className="ml-3 text-text-muted hover:text-text-primary transition-colors bg-transparent border-none cursor-pointer px-0.5 flex items-center"
-                      title={apiKeyRevealed ? t('api.hide') : t('api.show')}
-                    >
-                      {apiKeyRevealed ? (
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                          <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/>
-                        </svg>
-                      ) : (
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
-                        </svg>
-                      )}
-                    </button>
-                  </div>
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-[11px] text-text-muted">Base URL</span>
-                    <code
-                      className={`text-[11px] bg-white/[.05] px-1.5 py-0.5 rounded cursor-pointer hover:bg-white/[.1] transition-colors font-mono ${copiedField === 'base' ? 'text-ok' : 'text-text-primary'}`}
-                      onClick={() => copyToClipboard(apiBase, 'base')}
-                      title={t('api.click_to_copy')}
-                    >
-                      {copiedField === 'base' ? `✓ ${t('api.copied')}` : apiBase}
-                    </code>
-                  </div>
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-[11px] text-text-muted">{t('api.global_proxy')}</span>
-                    <span
-                      className={`inline-block w-1.5 h-1.5 rounded-full ${proxyError ? 'bg-err' : settings.notion_proxy ? 'bg-ok' : 'bg-text-muted/60'}`}
-                      title={proxyError ? proxyError : settings.notion_proxy ? t('api.proxy_enabled') : t('api.direct_connection')}
-                    />
-                    <input
-                      type="text"
-                      value={proxyDraft}
-                      onChange={e => { setProxyDraft(e.target.value); if (proxyError) setProxyError(null) }}
-                      onBlur={saveProxy}
-                      onKeyDown={e => {
-                        if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
-                        if (e.key === 'Escape') {
-                          setProxyDraft(settings.notion_proxy ?? '')
-                          setProxyError(null)
-                          ;(e.target as HTMLInputElement).blur()
-                        }
-                      }}
-                      placeholder={t('api.direct_connection_tip')}
-                      disabled={proxySaving}
-                      className={`text-[11px] bg-white/[.05] px-1.5 py-0.5 rounded font-mono outline-none border w-[160px] focus:w-[280px] transition-[width,border-color] duration-150 ${proxyError ? 'border-err text-err' : 'border-transparent focus:border-white/20 text-text-primary'} placeholder:text-text-muted/60`}
-                      title={proxyError || (settings.notion_proxy ? t('api.current_proxy', { proxy: settings.notion_proxy }) : t('api.current_direct'))}
-                    />
-                  </div>
-                </div>
-                <div className="flex items-center gap-5 ml-auto">
-                  <label className="flex items-center gap-2 cursor-pointer select-none">
-                    <button
-                      onClick={() => toggleSetting('enable_web_search')}
-                      className={`relative w-7 h-4 rounded-full transition-colors duration-200 cursor-pointer border-none ${settings.enable_web_search ? 'bg-[#4dab9a]' : 'bg-white/10 border border-white/5'}`}
-                    >
-                      <span className={`absolute top-[2px] left-[2px] w-3 h-3 rounded-full transition-all duration-200 ${settings.enable_web_search ? 'bg-white shadow-sm translate-x-[12px]' : 'bg-white/40'}`} />
-                    </button>
-                    <span className="text-[12px] text-white font-medium">{t('api.web_search')}</span>
-                  </label>
-                  <label className="flex items-center gap-2 cursor-pointer select-none">
-                    <button
-                      onClick={() => toggleSetting('enable_workspace_search')}
-                      className={`relative w-7 h-4 rounded-full transition-colors duration-200 cursor-pointer border-none ${settings.enable_workspace_search ? 'bg-[#4dab9a]' : 'bg-white/10 border border-white/5'}`}
-                    >
-                      <span className={`absolute top-[2px] left-[2px] w-3 h-3 rounded-full transition-all duration-200 ${settings.enable_workspace_search ? 'bg-white shadow-sm translate-x-[12px]' : 'bg-white/40'}`} />
-                    </button>
-                    <span className="text-[12px] text-text-primary">{t('api.workspace_search')}</span>
-                  </label>
-                  <label
-                    className="flex items-center gap-2 cursor-pointer select-none"
-                    title="开启后所有请求默认进入 ASK 模式（仅回答、不写入页面）。单次覆盖：在模型名末尾追加 -ask，例如 claude-sonnet-4.6-ask"
-                  >
-                    <button
-                      onClick={() => toggleSetting('ask_mode_default')}
-                      className={`relative w-7 h-4 rounded-full transition-colors duration-200 cursor-pointer border-none ${settings.ask_mode_default ? 'bg-[#4dab9a]' : 'bg-white/10 border border-white/5'}`}
-                    >
-                      <span className={`absolute top-[2px] left-[2px] w-3 h-3 rounded-full transition-all duration-200 ${settings.ask_mode_default ? 'bg-white shadow-sm translate-x-[12px]' : 'bg-white/40'}`} />
-                    </button>
-                    <span className="text-[12px] text-text-primary">{t('api.ask_mode')}</span>
-                  </label>
-                  <label className="flex items-center gap-2 cursor-pointer select-none">
-                    <button
-                      onClick={() => toggleSetting('debug_logging')}
-                      className={`relative w-7 h-4 rounded-full transition-colors duration-200 cursor-pointer border-none ${settings.debug_logging ? 'bg-[#4dab9a]' : 'bg-white/10 border border-white/5'}`}
-                    >
-                      <span className={`absolute top-[2px] left-[2px] w-3 h-3 rounded-full transition-all duration-200 ${settings.debug_logging ? 'bg-white shadow-sm translate-x-[12px]' : 'bg-white/40'}`} />
-                    </button>
-                    <span className="text-[12px] text-text-primary">{t('api.debug_log')}</span>
-                  </label>
-                </div>
-              </div>
-            </div>
-          )
-        })()}
-
+        <p className="text-[12px] text-text-secondary mb-5">{t('upgrade.business_only')}</p>
         {/* Section Title */}
         <div className="text-[12px] font-semibold text-text-secondary uppercase tracking-wider mb-3.5 flex items-center gap-1.5">
           <span>{t('common.accounts_pool')}</span>
-          <span className="font-normal text-text-muted">({filteredTotal})</span>
+          <span className="font-normal text-text-muted">({data ? filteredTotal : '—'})</span>
         </div>
 
         {/* Grid */}
-        {filteredTotal === 0 ? (
+        {data && (filteredTotal === 0 ? (
           <div className="text-center py-16 text-text-secondary text-sm">
             {t('common.no_matching_accounts')}
           </div>
         ) : (
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(340px,1fr))] gap-2.5 mb-4">
+          <div className="grid grid-cols-1 sm:grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-2.5 mb-4">
             {paged.map(acc => (
-              <AccountCard key={acc.account_id} account={acc} onChanged={loadData} />
+              <AccountCard key={acc.account_id} account={acc} onChanged={() => { void loadData(); setRoutingVersion(value => value + 1) }} routing={routing?.accounts.find(member => member.account_id === acc.account_id)} onToggle={toggleMember} toggling={!!memberSaving} />
             ))}
           </div>
-        )}
+        ))}
 
         {/* Pagination */}
         {totalPages > 1 && (
@@ -1160,33 +978,9 @@ export default function App() {
             </button>
           </div>
         )}
-        </div>
-      </main>
-      {showAddModal && <AddAccountModal onClose={() => setShowAddModal(false)} onSuccess={loadData} />}
 
-      <RegisterModal
-        open={registerOpen}
-        onClose={() => setRegisterOpen(false)}
-        onJobFinished={() => {
-          // Immediate reload so newly-registered accounts show up. The
-          // backend kicks off a per-account quota refresh in a goroutine
-          // after each success; that lands a few seconds later, so we
-          // schedule a second reload to pick up the freshly-cached
-          // quota_info from disk.
-          loadData()
-          window.setTimeout(() => { loadData() }, 4000)
-        }}
-      />
-      <HistoryDrawer
-        open={historyOpen}
-        onClose={() => setHistoryOpen(false)}
-        onRetryStarted={() => {
-          // Reload account list once the retry finishes so newly succeeded
-          // accounts surface in the dashboard. Best-effort: the drawer's
-          // own poller picks up live counters in the meantime.
-          window.setTimeout(() => { loadData() }, 4000)
-        }}
-      />
-    </div>
-  )
+      </section>}
+    </main>
+    {showAddModal && <AddAccountModal onClose={() => setShowAddModal(false)} onSuccess={() => setImportVersion(value => value + 1)} />}
+  </div>
 }

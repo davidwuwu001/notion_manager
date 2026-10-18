@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -55,9 +56,10 @@ func DiscoverAccountFromToken(tokenV2 string) (*Account, error) {
 // AccountDiscoveryOptions pins a multi-account Notion session to the intended
 // active user and workspace. Empty fields retain the legacy automatic choice.
 type AccountDiscoveryOptions struct {
-	ActiveUserID  string
-	SpaceID       string
-	ExpectedEmail string
+	ActiveUserID    string
+	SpaceID         string
+	ExpectedEmail   string
+	RequireBusiness bool
 }
 
 var (
@@ -193,6 +195,9 @@ func DiscoverAccountFromTokenWithOptions(tokenV2 string, options AccountDiscover
 
 	// Extract space view pointers from user_root
 	spaceViewPointers := spaceViewPointersForUser(userID)
+	if options.RequireBusiness && requestedSpaceID == "" && len(spaceViewPointers) > 1 {
+		return nil, fmt.Errorf("此账号有多个工作区，请从插件选择工作区并导出 JSON 后导入")
+	}
 
 	// Find the best space (AI enabled, non-free preferred)
 	type spaceInfo struct {
@@ -312,6 +317,12 @@ func DiscoverAccountFromTokenWithOptions(tokenV2 string, options AccountDiscover
 	}
 
 	acc.EnsureAccountID()
+	if options.RequireBusiness {
+		if err := requireBusinessSubscription(acc); err != nil {
+			return nil, err
+		}
+		acc.PlanType = "business"
+	}
 
 	// Step 2: Fetch available models
 	models, err := discoveryFetchModels(acc)
@@ -416,19 +427,20 @@ func SaveAccountToFile(acc *Account, dir string) (string, error) {
 	// Build the JSON structure
 	acc.EnsureAccountID()
 	data := map[string]interface{}{
-		"account_id":     acc.AccountID,
-		"token_v2":       acc.TokenV2,
-		"user_id":        acc.UserID,
-		"user_name":      acc.UserName,
-		"user_email":     acc.UserEmail,
-		"space_id":       acc.SpaceID,
-		"space_name":     acc.SpaceName,
-		"space_view_id":  acc.SpaceViewID,
-		"plan_type":      acc.PlanType,
-		"timezone":       acc.Timezone,
-		"client_version": acc.ClientVersion,
-		"browser_id":     acc.BrowserID,
-		"device_id":      acc.DeviceID,
+		"account_id":           acc.AccountID,
+		"token_v2":             acc.TokenV2,
+		"user_id":              acc.UserID,
+		"user_name":            acc.UserName,
+		"user_email":           acc.UserEmail,
+		"space_id":             acc.SpaceID,
+		"space_name":           acc.SpaceName,
+		"space_view_id":        acc.SpaceViewID,
+		"plan_type":            acc.PlanType,
+		"business_verified_at": acc.BusinessVerifiedAt,
+		"timezone":             acc.Timezone,
+		"client_version":       acc.ClientVersion,
+		"browser_id":           acc.BrowserID,
+		"device_id":            acc.DeviceID,
 	}
 	modelSnapshot := acc.modelsSnapshot()
 	quota := acc.quotaSnapshot()
@@ -441,19 +453,21 @@ func SaveAccountToFile(acc *Account, dir string) (string, error) {
 	}
 	if quota.Info != nil {
 		data["quota_info"] = map[string]interface{}{
-			"rate_limit":          quota.Info.RateLimit,
-			"rate_limit_error":    quota.Info.RateLimitError,
-			"is_eligible":         quota.Info.IsEligible,
-			"space_usage":         quota.Info.SpaceUsage,
-			"space_limit":         quota.Info.SpaceLimit,
-			"user_usage":          quota.Info.UserUsage,
-			"user_limit":          quota.Info.UserLimit,
-			"last_usage_at":       quota.Info.LastUsageAtMs,
-			"research_mode_usage": quota.Info.ResearchModeUsage,
-			"has_premium":         quota.Info.HasPremium,
-			"premium_balance":     quota.Info.PremiumBalance,
-			"premium_usage":       quota.Info.PremiumUsage,
-			"premium_limit":       quota.Info.PremiumLimit,
+			"rate_limit":            quota.Info.RateLimit,
+			"rate_limit_error":      quota.Info.RateLimitError,
+			"is_eligible":           quota.Info.IsEligible,
+			"space_usage":           quota.Info.SpaceUsage,
+			"space_limit":           quota.Info.SpaceLimit,
+			"user_usage":            quota.Info.UserUsage,
+			"user_limit":            quota.Info.UserLimit,
+			"last_usage_at":         quota.Info.LastUsageAtMs,
+			"research_mode_usage":   quota.Info.ResearchModeUsage,
+			"has_premium":           quota.Info.HasPremium,
+			"premium_balance":       quota.Info.PremiumBalance,
+			"premium_balance_known": quota.Info.PremiumBalanceKnown,
+			"quota_status_reason":   quota.Info.QuotaStatusReason,
+			"premium_usage":         quota.Info.PremiumUsage,
+			"premium_limit":         quota.Info.PremiumLimit,
 		}
 	}
 	if quota.CheckedAt != nil {
@@ -488,6 +502,7 @@ func (p *AccountPool) AddAccount(acc *Account) {
 		existing.EnsureAccountID()
 		if existing.AccountID != "" && existing.AccountID == acc.AccountID {
 			// Replace existing (same workspace)
+			globalSessionManager.DeleteByAccountID(acc.AccountID)
 			p.accounts[i] = acc
 			log.Printf("[account] replaced: %s (%s) aid=%s", acc.UserName, acc.UserEmail, acc.ShortSpaceID())
 			return
@@ -564,7 +579,7 @@ func DeleteAccountFileByEmail(email, dir string) error {
 	}
 	switch len(matches) {
 	case 0:
-		return fmt.Errorf("account file not found for %s", email)
+		return fmt.Errorf("account file not found: %w", os.ErrNotExist)
 	case 1:
 		if err := os.Remove(matches[0]); err != nil {
 			return fmt.Errorf("delete file: %w", err)
@@ -596,6 +611,7 @@ func HandleAddAccount(pool *AccountPool, accountsDir string, auth *DashboardAuth
 		var body struct {
 			TokenV2      string `json:"token_v2"`
 			NotionUserID string `json:"notion_user_id"`
+			SpaceID      string `json:"space_id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
@@ -611,7 +627,9 @@ func HandleAddAccount(pool *AccountPool, accountsDir string, auth *DashboardAuth
 
 		// Discover account info
 		acc, err := DiscoverAccountFromTokenWithOptions(tokenV2, AccountDiscoveryOptions{
-			ActiveUserID: strings.TrimSpace(body.NotionUserID),
+			ActiveUserID:    strings.TrimSpace(body.NotionUserID),
+			SpaceID:         strings.TrimSpace(body.SpaceID),
+			RequireBusiness: true,
 		})
 		if err != nil {
 			log.Printf("[add-account] discovery failed: %v", err)
@@ -645,6 +663,7 @@ func HandleAddAccount(pool *AccountPool, accountsDir string, auth *DashboardAuth
 				"name":      acc.UserName,
 				"email":     acc.UserEmail,
 				"space":     acc.SpaceName,
+				"space_id":  acc.SpaceID,
 				"plan_type": acc.PlanType,
 			},
 		})
@@ -668,42 +687,36 @@ func HandleDeleteAccount(pool *AccountPool, accountsDir string, auth *DashboardA
 		}
 
 		var body struct {
-			Email string `json:"email"`
+			Email     string `json:"email"`
+			AccountID string `json:"account_id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
 			return
 		}
 		email := strings.TrimSpace(body.Email)
-		if email == "" {
+		if email == "" && body.AccountID == "" {
 			http.Error(w, `{"error":"email is required"}`, http.StatusBadRequest)
 			return
 		}
 
-		// Remove from pool and get account_id for file deletion
-		acc := pool.GetByEmail(email)
-		if acc == nil {
-			w.WriteHeader(http.StatusNotFound)
-			json.NewEncoder(w).Encode(map[string]string{"error": "account not found in pool"})
+		var deleteErr error
+		if body.AccountID != "" {
+			deleteErr = deleteAccountByID(pool, accountsDir, body.AccountID)
+		} else {
+			deleteErr = deleteAccountByEmail(pool, accountsDir, email)
+		}
+		if deleteErr != nil {
+			var ambiguous *AmbiguousEmailError
+			status := http.StatusInternalServerError
+			if errors.As(deleteErr, &ambiguous) {
+				status = http.StatusConflict
+			} else if errors.Is(deleteErr, os.ErrNotExist) {
+				status = http.StatusNotFound
+			}
+			http.Error(w, `{"error":"account could not be deleted; select a unique account_id"}`, status)
 			return
 		}
-		acc.EnsureAccountID()
-		accountID := acc.AccountID
-		pool.RemoveAccountByEmail(email)
-
-		// Delete file by account_id
-		if accountID != "" {
-			if err := DeleteAccountFile(accountID, accountsDir); err != nil {
-				log.Printf("[delete-account] file deletion warning: %v", err)
-			}
-		} else {
-			// Legacy fallback: no account_id available
-			if err := DeleteAccountFileByEmail(email, accountsDir); err != nil {
-				log.Printf("[delete-account] file deletion warning (by email): %v", err)
-			}
-		}
-
-		log.Printf("[delete-account] removed: %s (account_id=%s)", email, accountID)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	}
 }

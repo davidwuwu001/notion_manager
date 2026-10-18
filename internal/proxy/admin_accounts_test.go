@@ -134,7 +134,7 @@ func TestSummarizeAccountsAggregates(t *testing.T) {
 		account("a", "a@x", map[string]interface{}{
 			"remaining": 100, "space_usage": 10, "space_limit": 200, "user_usage": 12, "user_limit": 200,
 			"space_remaining": 190, "user_remaining": 188,
-			"premium_balance": 500, "premium_limit": 500, "has_premium": true,
+			"premium_balance": 500, "premium_balance_known": true, "premium_limit": 500, "has_premium": true,
 		}),
 		account("b", "b@x", map[string]interface{}{
 			"remaining": 0, "exhausted": true,

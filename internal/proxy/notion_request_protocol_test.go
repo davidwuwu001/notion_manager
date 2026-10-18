@@ -461,7 +461,7 @@ func TestParseNDJSONStreamHandlesCapturedPatchV2Sequence(t *testing.T) {
 	if doneCount != 1 {
 		t.Fatalf("done callbacks = %d, want 1", doneCount)
 	}
-	wantUsage := UsageInfo{PromptTokens: 12, CompletionTokens: 2, TotalTokens: 14}
+	wantUsage := UsageInfo{PromptTokens: 12, CompletionTokens: 2, TotalTokens: 14, InputKnown: true, OutputKnown: true}
 	if finalUsage != wantUsage {
 		t.Fatalf("usage = %+v, want %+v", finalUsage, wantUsage)
 	}

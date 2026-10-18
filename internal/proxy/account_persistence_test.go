@@ -731,6 +731,9 @@ func TestAccountLoadsFailClosedWhenChmodFails(t *testing.T) {
 }
 
 func TestReloadFromDirSkipsCredentialsWhoseChmodFails(t *testing.T) {
+	oldChecker := businessSubscriptionChecker
+	businessSubscriptionChecker = func(*Account) error { return nil }
+	t.Cleanup(func() { businessSubscriptionChecker = oldChecker })
 	dir := t.TempDir()
 	blockedPath := filepath.Join(dir, "blocked.json")
 	if err := os.WriteFile(blockedPath, []byte("blocked-secret-token"), 0o644); err != nil {

@@ -10,6 +10,9 @@ export default defineConfig({
       '/admin': 'http://localhost:8081',
       '/proxy': 'http://localhost:8081',
       '/health': 'http://localhost:8081',
+      '/v1': 'http://localhost:8081',
+      '/dashboard/auth': 'http://localhost:8081',
+      '/dashboard/extension.zip': 'http://localhost:8081',
     },
   },
   build: {

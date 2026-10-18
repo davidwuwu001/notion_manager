@@ -235,14 +235,16 @@ func TestLoadStartupAccountsKeepsSelectorsIsolatedBySlot(t *testing.T) {
 	}
 
 	wantFirst := proxy.AccountDiscoveryOptions{
-		ActiveUserID:  "first-user",
-		SpaceID:       "first-space",
-		ExpectedEmail: "first@example.test",
+		RequireBusiness: true,
+		ActiveUserID:    "first-user",
+		SpaceID:         "first-space",
+		ExpectedEmail:   "first@example.test",
 	}
 	wantSecond := proxy.AccountDiscoveryOptions{
-		ActiveUserID:  "second-user",
-		SpaceID:       "second-space",
-		ExpectedEmail: "second@example.test",
+		RequireBusiness: true,
+		ActiveUserID:    "second-user",
+		SpaceID:         "second-space",
+		ExpectedEmail:   "second@example.test",
 	}
 	if got := seen["first-token"]; got != wantFirst {
 		t.Fatalf("first selectors = %#v, want %#v", got, wantFirst)
@@ -408,9 +410,10 @@ func TestLoadStartupAccountsKeepsLegacySecretCompatible(t *testing.T) {
 		t.Fatalf("discovery token = %q, want legacy token", gotToken)
 	}
 	wantOptions := proxy.AccountDiscoveryOptions{
-		ActiveUserID:  "legacy-user",
-		SpaceID:       "legacy-space",
-		ExpectedEmail: "legacy@example.test",
+		RequireBusiness: true,
+		ActiveUserID:    "legacy-user",
+		SpaceID:         "legacy-space",
+		ExpectedEmail:   "legacy@example.test",
 	}
 	if gotOptions != wantOptions {
 		t.Fatalf("legacy selectors = %#v, want %#v", gotOptions, wantOptions)

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"sync"
 	"time"
@@ -9,22 +10,23 @@ import (
 // ========== Account ==========
 
 type Account struct {
-	mu            sync.RWMutex
-	TokenV2       string       `json:"token_v2"`
-	UserID        string       `json:"user_id"`
-	UserName      string       `json:"user_name"`
-	UserEmail     string       `json:"user_email"`
-	SpaceID       string       `json:"space_id"`
-	SpaceName     string       `json:"space_name"`
-	AccountID     string       `json:"account_id,omitempty"` // SHA-256(user_id + "\0" + space_id)
-	SpaceViewID   string       `json:"space_view_id"`
-	PlanType      string       `json:"plan_type"`
-	Timezone      string       `json:"timezone"`
-	ClientVersion string       `json:"client_version"`
-	BrowserID     string       `json:"browser_id,omitempty"`
-	DeviceID      string       `json:"device_id,omitempty"`
-	FullCookie    string       `json:"full_cookie,omitempty"`
-	Models        []ModelEntry `json:"available_models"`
+	mu                 sync.RWMutex
+	TokenV2            string       `json:"token_v2"`
+	UserID             string       `json:"user_id"`
+	UserName           string       `json:"user_name"`
+	UserEmail          string       `json:"user_email"`
+	SpaceID            string       `json:"space_id"`
+	SpaceName          string       `json:"space_name"`
+	AccountID          string       `json:"account_id,omitempty"` // SHA-256(user_id + "\0" + space_id)
+	SpaceViewID        string       `json:"space_view_id"`
+	PlanType           string       `json:"plan_type"`
+	BusinessVerifiedAt *time.Time   `json:"business_verified_at,omitempty"`
+	Timezone           string       `json:"timezone"`
+	ClientVersion      string       `json:"client_version"`
+	BrowserID          string       `json:"browser_id,omitempty"`
+	DeviceID           string       `json:"device_id,omitempty"`
+	FullCookie         string       `json:"full_cookie,omitempty"`
+	Models             []ModelEntry `json:"available_models"`
 	// RegisteredVia tags which Provider.ID() created this account (e.g.
 	// "microsoft"). Empty for accounts onboarded before the provider
 	// registry existed; the dashboard treats those as legacy Microsoft.
@@ -59,10 +61,12 @@ type QuotaInfo struct {
 	// Research mode (from V1 API: getAIUsageEligibility)
 	ResearchModeUsage int `json:"researchModeUsage"` // usage when "Share data to improve AI" is enabled
 	// Premium credits (from V2 API: getAIUsageEligibilityV2)
-	HasPremium     bool `json:"hasPremium"`
-	PremiumBalance int  `json:"premiumBalance"` // remaining premium credits
-	PremiumUsage   int  `json:"premiumUsage"`   // used premium credits (monthlyAllocated)
-	PremiumLimit   int  `json:"premiumLimit"`   // total premium credit limit
+	HasPremium          bool   `json:"hasPremium"`
+	PremiumBalance      int    `json:"premiumBalance"` // remaining premium credits
+	PremiumBalanceKnown bool   `json:"premium_balance_known"`
+	QuotaStatusReason   string `json:"quota_status_reason,omitempty"`
+	PremiumUsage        int    `json:"premiumUsage"` // used premium credits (monthlyAllocated)
+	PremiumLimit        int    `json:"premiumLimit"` // total premium credit limit
 }
 
 // CreditRateLimit is the allowance shown in Notion's AI Usage settings, separate from premium credits.
@@ -103,8 +107,8 @@ type quotaV2Response struct {
 		LastSpaceUsageAtMs int64 `json:"lastSpaceUsageAtMs"`
 	} `json:"basicCredits"`
 	PremiumCredits struct {
-		TotalCreditBalance int `json:"totalCreditBalance"`
-		CreditsInOverage   int `json:"creditsInOverage"`
+		TotalCreditBalance *int `json:"totalCreditBalance"`
+		CreditsInOverage   int  `json:"creditsInOverage"`
 		PerSource          struct {
 			MonthlyAllocated struct {
 				UsageTotal int `json:"usageTotal"`
@@ -161,9 +165,11 @@ type ToolCallFunction struct {
 }
 
 type UsageInfo struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	InputKnown       bool `json:"-"`
+	OutputKnown      bool `json:"-"`
+	PromptTokens     int  `json:"prompt_tokens"`
+	CompletionTokens int  `json:"completion_tokens"`
+	TotalTokens      int  `json:"total_tokens"`
 }
 
 // ========== Notion API Types ==========
@@ -269,6 +275,7 @@ type CitationCandidate struct {
 
 // CallOptions holds optional parameters for CallInference
 type CallOptions struct {
+	Context               context.Context
 	NativeToolUses        *[]AgentValueEntry
 	ThinkingBlocks        *[]ThinkingBlock
 	EnableWebSearch       bool                  // force useWebSearch=true in Notion config

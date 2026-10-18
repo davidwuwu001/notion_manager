@@ -1,8 +1,8 @@
 const STRINGS = {
   zh: {
     subtitle: '一键提取账号配置，用于 Notion AI Proxy',
-    statusInitial: '点击下方按钮，在 Notion 页面上提取账号配置。',
-    extractBtn: '⚡ 提取配置',
+    statusInitial: '读取当前登录账号，选择正式 Business 工作区，即可直接导入本机账号池。无需导出文件。',
+    extractBtn: '读取当前账号与工作区',
     copyBtn: '📋 复制 JSON 配置',
     extracting: '<span class="spinner"></span>正在提取配置...',
     noCookies: '未找到 notion.so cookies。请先登录 Notion。',
@@ -21,8 +21,8 @@ const STRINGS = {
   },
   en: {
     subtitle: 'One-click account config extractor for Notion AI Proxy',
-    statusInitial: 'Click the button below to extract the account configuration on the Notion page.',
-    extractBtn: '⚡ Extract Config',
+    statusInitial: 'Read your signed-in account, select a verified Business workspace, and import directly into the local pool.',
+    extractBtn: 'Read account and workspaces',
     copyBtn: '📋 Copy JSON Config',
     extracting: '<span class="spinner"></span>Extracting configuration...',
     noCookies: 'No notion.so cookies found. Please log in to Notion first.',
@@ -42,6 +42,8 @@ const STRINGS = {
 };
 
 let currentLang = localStorage.getItem('notion-ext-lang') || 'zh';
+let extractedConfig = null;
+let extractedWorkspaces = [];
 
 function updateUI() {
   const s = STRINGS[currentLang];
@@ -52,6 +54,7 @@ function updateUI() {
   }
   document.getElementById('extractBtn').textContent = s.extractBtn;
   document.getElementById('copyBtn').textContent = s.copyBtn;
+  document.getElementById('exportBtn').textContent = currentLang === 'zh' ? '下载账号 JSON 文件' : 'Download account JSON';
   document.getElementById('langToggleBtn').textContent = currentLang === 'zh' ? '🌐 EN' : '🌐 中文';
 }
 
@@ -62,22 +65,20 @@ async function extract() {
   const s = STRINGS[currentLang];
 
   extractBtn.disabled = true;
+  extractedConfig = null;
+  document.getElementById('importBtn').disabled = true;
+  resultEl.classList.add('hidden');
   statusEl.className = 'status loading';
   statusEl.innerHTML = s.extracting;
 
   try {
-    // Step 1: Get all cookies via chrome.cookies API (can read HttpOnly!)
-    const allCookies = await new Promise((resolve, reject) => {
-      chrome.cookies.getAll({ domain: 'notion.so' }, (cookies) => {
-        if (cookies && cookies.length > 0) resolve(cookies);
-        else reject(new Error(s.noCookies));
-      });
-    });
+    const session = await readCurrentNotionSession();
+    const allCookies = await chrome.cookies.getAll({ url: session.tab.url });
 
     const cookieMap = {};
     for (const c of allCookies) cookieMap[c.name] = c.value;
 
-    const token = cookieMap['token_v2'];
+    const token = session.token;
     if (!token) throw new Error(s.noToken);
 
     const browserId = cookieMap['notion_browser_id'] || '';
@@ -90,16 +91,13 @@ async function extract() {
     statusEl.innerHTML = s.cookiesSuccess;
 
     // Step 2: Get active tab and inject script to call Notion APIs
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-
-    if (!tab?.url?.includes('notion.so')) {
-      throw new Error(s.openNotionFirst);
-    }
+    const tab = session.tab;
 
     // Step 3: Inject content script to call APIs with credentials
     const [{ result: accountData }] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      func: async () => {
+      args: [session.userId],
+      func: async (activeUserId) => {
         try {
           // Call loadUserContent
           const userResp = await fetch('/api/v3/loadUserContent', {
@@ -114,16 +112,38 @@ async function extract() {
 
           const getVal = (record) => record?.value?.value || record?.value;
 
-          const userId = Object.keys(rm.notion_user)[0];
+          const userId = activeUserId;
+          if (!rm.notion_user?.[userId]) throw new Error('当前登录身份与 Notion 返回的用户不匹配');
           const user = getVal(rm.notion_user[userId]);
           const userRoot = getVal(rm.user_root[userId]);
           const spacePointers = userRoot.space_view_pointers || [];
 
           // Find best space (AI enabled, non-free preferred)
           let bestSpace = null;
+          const workspaces = [];
           for (const ptr of spacePointers) {
             const spaceData = getVal(rm.space?.[ptr.spaceId]);
             if (spaceData) {
+              const workspace = { id: spaceData.id || ptr.spaceId, name: spaceData.name || ptr.spaceId, plan_type: 'unknown', business_verified: false, space_view_id: ptr.id };
+              try {
+                const response = await fetch('/api/v3/getFeatureBillingData', {
+                  method: 'POST', credentials: 'include',
+                  headers: { 'Content-Type': 'application/json', 'x-notion-active-user-header': activeUserId },
+                  body: JSON.stringify({ spaceId: workspace.id }),
+                });
+                if (!response.ok) throw new Error('subscription check failed');
+                const { billingData: billing } = await response.json();
+                if (!billing || !['public', 'admin'].includes(billing.type)) throw new Error('unknown subscription');
+                const subscription = billing.subscription;
+                const trialEnd = subscription?.trialEnd;
+                const trial = billing.trial != null || (trialEnd != null && (!Number.isFinite(Date.parse(trialEnd)) || Date.parse(trialEnd) > Date.now()));
+                const products = (subscription?.items || []).map(item => item.price?.product);
+                workspace.plan_type = trial ? 'Business Trial（不可导入）' : products.find(p => ['business', 'enterprise', 'plus'].includes(p)) || 'free';
+                workspace.business_verified = !trial && products.includes('business');
+              } catch {
+                workspace.plan_type = '未确认订阅（不可导入）';
+              }
+              workspaces.push(workspace);
               const aiEnabled = spaceData.settings?.enable_ai_feature !== false &&
                                 spaceData.settings?.disable_ai_feature !== true;
               if (!bestSpace || (aiEnabled && spaceData.plan_type !== 'free')) {
@@ -199,7 +219,8 @@ async function extract() {
             plan_type: bestSpace.plan_type,
             timezone: timezone,
             client_version: clientVersion,
-            available_models: models
+            available_models: models,
+            workspaces
           };
         } catch (err) {
           return { success: false, error: err.message };
@@ -235,21 +256,54 @@ async function extract() {
     statusEl.textContent = s.success;
 
     const infoRows = document.getElementById('infoRows');
-    infoRows.innerHTML = [
+    infoRows.replaceChildren();
+    for (const [label, value] of [
       [s.labelUser, `${config.user_name} (${config.user_email})`],
-      [s.labelWorkspace, `${config.space_name} (${config.plan_type})`],
       [s.labelTimezone, config.timezone],
       [s.labelVersion, config.client_version],
-      [s.labelToken, config.token_v2.substring(0, 20) + '...'],
-    ].map(([label, value]) =>
-      `<div class="info-row"><span class="info-label">${label}</span><span class="info-value">${value}</span></div>`
-    ).join('');
+    ]) {
+      const row = document.createElement('div');
+      row.className = 'info-row';
+      for (const [className, text] of [['info-label', label], ['info-value', value]]) {
+        const span = document.createElement('span');
+        span.className = className;
+        span.textContent = text;
+        row.appendChild(span);
+      }
+      infoRows.appendChild(row);
+    }
 
     const modelTags = document.getElementById('modelTags');
-    modelTags.innerHTML = config.available_models
-      .map(m => `<span class="model-tag">${m.name}</span>`).join('');
+    modelTags.replaceChildren();
+    for (const model of config.available_models) {
+      const span = document.createElement('span');
+      span.className = 'model-tag';
+      span.textContent = model.name;
+      modelTags.appendChild(span);
+    }
 
-    document.getElementById('configJson').value = JSON.stringify(config, null, 2);
+    extractedConfig = config;
+    extractedWorkspaces = accountData.workspaces;
+    const select = document.getElementById('workspaceSelect');
+    select.replaceChildren();
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = currentLang === 'zh' ? '请选择工作区（按 ID 区分同名工作区）' : 'Select workspace (check its ID)';
+    select.appendChild(placeholder);
+    for (const workspace of extractedWorkspaces) {
+      const option = document.createElement('option');
+      option.value = workspace.id;
+      option.textContent = `${workspace.name} (${workspace.business_verified ? 'Business Plan' : workspace.plan_type}) · ${workspace.id}`;
+      option.disabled = !workspace.business_verified;
+      select.appendChild(option);
+    }
+    const allowed = extractedWorkspaces.filter(workspace => workspace.business_verified);
+    select.value = allowed.length === 1 ? allowed[0].id : '';
+    if (!allowed.length) {
+      statusEl.className = 'status error';
+      statusEl.textContent = '未找到可确认的正式 Business Plan；试用、Free 和订阅不明的工作区不能导出。';
+    }
+    selectWorkspace();
     resultEl.classList.remove('hidden');
 
   } catch (err) {
@@ -260,12 +314,67 @@ async function extract() {
   }
 }
 
-function copyConfig() {
-  const textarea = document.getElementById('configJson');
-  textarea.select();
-  document.execCommand('copy');
+function selectWorkspace() {
+  const id = document.getElementById('workspaceSelect').value;
+  const workspace = extractedWorkspaces.find(item => item.id === id && item.business_verified);
+  document.getElementById('exportBtn').disabled = !workspace;
+  document.getElementById('copyBtn').disabled = !workspace;
+  document.getElementById('importBtn').disabled = !workspace;
+  document.getElementById('importStatus').className = 'status info';
+  document.getElementById('importStatus').textContent = '仅导入所选工作区；后端将再次核实正式 Business 订阅。';
+  const tags = document.getElementById('modelTags');
+  tags.replaceChildren();
+  if (workspace && workspace.id === extractedConfig?.space_id) {
+    for (const model of extractedConfig.available_models || []) {
+      const span = document.createElement('span');
+      span.className = 'model-tag';
+      span.textContent = model.name;
+      tags.appendChild(span);
+    }
+  }
+  const config = getSelectedAccountConfig();
+  document.getElementById('configJson').value = config ? JSON.stringify(config, null, 2) : '';
+}
 
+function getSelectedAccountConfig() {
+  const id = document.getElementById('workspaceSelect').value;
+  const workspace = extractedWorkspaces.find(item => item.id === id && item.business_verified);
+  return workspace && extractedConfig ? {
+    token_v2: extractedConfig.token_v2,
+    user_id: extractedConfig.user_id,
+    user_name: extractedConfig.user_name,
+    user_email: extractedConfig.user_email,
+    space_id: workspace.id,
+    space_name: workspace.name,
+    plan_type: workspace.plan_type,
+    extracted_at: new Date().toISOString(),
+  } : null;
+}
+
+function exportConfig() {
+  const text = document.getElementById('configJson').value;
+  if (!text) return;
+  const config = JSON.parse(text);
+  const blob = new Blob([text], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `notion-account-${config.space_id.replace(/[^a-zA-Z0-9-]/g, '_')}.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function copyConfig() {
+  const textarea = document.getElementById('configJson');
   const btn = document.getElementById('copyBtn');
+  try {
+    await navigator.clipboard.writeText(textarea.value);
+  } catch {
+    btn.textContent = currentLang === 'zh' ? '复制失败，请下载 JSON 文件' : 'Copy failed; download JSON instead';
+    return;
+  }
   btn.textContent = STRINGS[currentLang].copied;
   btn.classList.add('copied');
   setTimeout(() => {
@@ -276,6 +385,8 @@ function copyConfig() {
 
 document.getElementById('extractBtn').addEventListener('click', extract);
 document.getElementById('copyBtn').addEventListener('click', copyConfig);
+document.getElementById('exportBtn').addEventListener('click', exportConfig);
+document.getElementById('workspaceSelect').addEventListener('change', selectWorkspace);
 document.getElementById('langToggleBtn').addEventListener('click', () => {
   currentLang = currentLang === 'zh' ? 'en' : 'zh';
   localStorage.setItem('notion-ext-lang', currentLang);

@@ -572,6 +572,7 @@ func (c *Config) QuotaLiveCheckInterval() time.Duration {
 
 // WebSearchEnabled returns the effective web search setting (default: true)
 func (c *Config) WebSearchEnabled() bool {
+	c = effectiveDashboardConfig(c)
 	if c.Proxy.EnableWebSearch == nil {
 		return true
 	}
@@ -580,6 +581,7 @@ func (c *Config) WebSearchEnabled() bool {
 
 // WorkspaceSearchEnabled returns the effective workspace search setting (default: false)
 func (c *Config) WorkspaceSearchEnabled() bool {
+	c = effectiveDashboardConfig(c)
 	if c.Proxy.EnableWorkspaceSearch == nil {
 		return false
 	}
@@ -591,6 +593,7 @@ func (c *Config) WorkspaceSearchEnabled() bool {
 // model answers without making page edits. Per-request `-ask` suffix on the
 // model name still overrides the default for that single call.
 func (c *Config) AskModeDefault() bool {
+	c = effectiveDashboardConfig(c)
 	if c == nil || c.Proxy.AskModeDefault == nil {
 		return false
 	}
@@ -602,6 +605,7 @@ func (c *Config) AskModeDefault() bool {
 // time so a /admin/settings PUT takes effect on the next dial without a
 // process restart.
 func (c *Config) NotionProxyURL() string {
+	c = effectiveDashboardConfig(c)
 	if c == nil {
 		return ""
 	}

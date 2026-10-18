@@ -8,7 +8,10 @@ export interface AccountInfo {
   email: string
   name: string
   plan: string
+  subscription_status?: 'verified_business' | 'legacy_unverified'
+  business_verified_at?: string
   space: string
+  space_id?: string
   space_id_short?: string
   exhausted: boolean
   permanent: boolean
@@ -37,7 +40,9 @@ export interface AccountInfo {
   models?: Model[]
   research_usage?: number
   has_premium?: boolean
-  premium_balance?: number
+  premium_balance: number | null
+  premium_balance_known: boolean
+  quota_status_reason?: 'premium_balance_unknown' | 'premium_balance_conflict' | 'eligibility_conflict'
   premium_usage?: number
   premium_limit?: number
   rate_limit?: {
@@ -124,6 +129,7 @@ export interface AccountSummary {
   total_user_limit: number
   total_user_remaining: number
   total_premium_balance: number
+  premium_unknown_accounts: number
   total_premium_limit: number
 }
 
@@ -183,4 +189,129 @@ export interface TokenStats {
   top_models: TokenModelRow[]
   top_accounts: TokenAccountRow[]
   last_record_at: number
+}
+
+export interface LogCoverage {
+  storage_status: 'ok' | 'degraded' | 'unavailable'
+  captured_since: number
+  retained_from: number
+  data_complete: boolean
+  retention_days: number
+}
+
+export interface RequestUsage {
+  input_tokens: number | null
+  output_tokens: number | null
+  usage_source: 'actual' | 'estimated' | 'unknown' | 'mixed'
+  reported_input_tokens: number | null
+  reported_output_tokens: number | null
+  estimated_input_tokens: number | null
+  estimated_output_tokens: number | null
+  upstream_call_count: number
+  reported_calls: number
+  estimated_calls: number
+  unknown_calls: number
+  usage_completeness: 'complete' | 'partial' | 'unknown'
+}
+
+export type RequestStatus = 'in_progress' | 'success' | 'rejected' | 'failed' | 'cancelled' | 'interrupted'
+export interface RequestLog extends RequestUsage {
+  schema_version: number
+  request_id: string
+  started_at_ms: number
+  finished_at_ms: number | null
+  protocol: 'anthropic_messages' | 'openai_chat' | 'openai_responses'
+  requested_model: string
+  resolved_model: string
+  stream: boolean
+  status: RequestStatus
+  http_status: number
+  duration_ms: number | null
+  first_token_ms: number | null
+  final_account_id: string | null
+  attempt_count: number
+  error_code: string
+  partial_response: boolean
+  completion_emitted: boolean
+}
+
+export interface RequestAttempt extends RequestUsage {
+  request_id: string
+  attempt_no: number
+  account_id: string
+  started_at_ms: number
+  finished_at_ms: number | null
+  duration_ms: number | null
+  outcome: string
+  error_code: string
+  retry_reason: string
+  cooldown_until_ms: number | null
+  response_committed: boolean
+  content_emitted: boolean
+  tool_call_emitted: boolean
+}
+
+export interface RequestLogList extends LogCoverage {
+  items: RequestLog[]
+  total: number
+  next_cursor: string | null
+}
+
+export interface RequestLogDetail extends LogCoverage {
+  request: RequestLog
+  attempts: RequestAttempt[]
+}
+
+export interface RequestMetrics extends RequestUsage {
+  total_requests: number
+  in_progress: number
+  success: number
+  rejected: number
+  failed: number
+  cancelled: number
+  interrupted: number
+  success_rate: number | null
+  avg_duration_ms: number | null
+  p50_duration_ms: number | null
+  p95_duration_ms: number | null
+}
+
+export interface RequestAnalytics extends LogCoverage {
+  from: number
+  to: number
+  bucket_ms: number
+  overview: RequestMetrics
+  timeline: Array<Pick<RequestMetrics, 'total_requests' | 'in_progress' | 'success' | 'rejected' | 'failed' | 'cancelled' | 'interrupted'> & { started_at_ms: number }>
+  models: Array<RequestMetrics & { model: string }>
+  accounts: Array<RequestUsage & { account_id: string; requests: number; attempts: number; success: number; failed: number; cancelled: number }>
+}
+
+export interface RoutingConfig {
+  mode: 'quota' | 'round_robin'
+  max_attempts: number
+  max_concurrent_per_account: number
+  disabled_account_ids: string[]
+  retention_days: number
+}
+
+export interface RoutingMember {
+  account_id: string
+  enabled: boolean
+  status: 'available' | 'paused' | 'exhausted' | 'cooldown' | 'invalid' | 'busy' | 'no_workspace'
+  reason: string
+  score_source: string
+  quota_checked_at_ms?: number
+  cooldown_until_ms?: number
+  in_flight: number
+}
+
+export interface RoutingData extends RoutingConfig {
+  total: number
+  available: number
+  paused: number
+  exhausted: number
+  cooldown: number
+  invalid: number
+  busy: number
+  accounts: RoutingMember[]
 }

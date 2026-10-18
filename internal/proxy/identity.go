@@ -19,6 +19,8 @@ func (acc *Account) EnsureAccountID() {
 	if acc == nil {
 		return
 	}
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
 	if acc.AccountID == "" && acc.UserID != "" && acc.SpaceID != "" {
 		acc.AccountID = ComputeAccountID(acc.UserID, acc.SpaceID)
 	}

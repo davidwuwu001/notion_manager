@@ -32,6 +32,16 @@ body {
   min-height: 100vh;
 }
 
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--color-notion-blue);
+  outline-offset: 3px;
+}
+
+.dashboard-table { width: 100%; border-collapse: collapse; font-size: 12px; text-align: left; }
+.dashboard-table th, .dashboard-table td { padding: 10px 12px; border-bottom: 1px solid var(--color-border); vertical-align: top; }
+.dashboard-table th { color: var(--color-text-secondary); font-weight: 500; white-space: nowrap; }
+.dashboard-table tr:last-child td { border-bottom: 0; }
+
 ::-webkit-scrollbar {
   width: 8px;
 }

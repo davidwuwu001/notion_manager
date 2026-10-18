@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	extension "notion-manager/chrome-extension"
 	"notion-manager/internal/web"
 )
 
@@ -28,6 +29,22 @@ func NewDashboardAuth(adminPasswordHash, apiKey string) *DashboardAuth {
 }
 
 // HasAdminPassword returns true if an admin password is configured.
+func (da *DashboardAuth) HandleConnection() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		if !da.ValidateSession(r) {
+			http.Error(w, `{"error":"dashboard login required"}`, http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"api_key": da.apiKey})
+	}
+}
+
 func (da *DashboardAuth) HasAdminPassword() bool {
 	return da.adminPasswordHash != "" && IsAdminPasswordHashed(da.adminPasswordHash)
 }
@@ -165,7 +182,14 @@ func (da *DashboardAuth) HandleAuthLogout() http.HandlerFunc {
 // HandleAuthCheck returns whether the current session is valid.
 func (da *DashboardAuth) HandleAuthCheck() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !da.HasAdminPassword() && !da.ValidateSession(r) && r.Header.Get("Sec-Fetch-Site") != "cross-site" {
+			origin := r.Header.Get("Origin")
+			if origin == "" || origin == "http://"+r.Host || origin == "https://"+r.Host {
+				da.CreateSession(w)
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"authenticated": da.ValidateSession(r),
 			"required":      da.HasAdminPassword(),
@@ -233,6 +257,9 @@ func HandleDashboard(apiKey string, auth *DashboardAuth) http.Handler {
 
 		// Auth API endpoints
 		switch path {
+		case "/extension.zip":
+			extension.Download(w, r)
+			return
 		case "/auth/salt":
 			auth.HandleAuthSalt()(w, r)
 			return
@@ -254,8 +281,7 @@ func HandleDashboard(apiKey string, auth *DashboardAuth) http.Handler {
 				http.Error(w, "index.html not found", http.StatusInternalServerError)
 				return
 			}
-			html := strings.Replace(string(data), "<head>",
-				`<head><meta name="api-key" content="`+apiKey+`">`, 1)
+			html := string(data)
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Write([]byte(html))
@@ -296,7 +322,12 @@ func HandleProxyStart(pool *AccountPool, rp *ReverseProxy, auth *DashboardAuth) 
 		} else if accountID != "" {
 			acc = pool.FindByAccountID(accountID)
 		} else if email != "" {
-			acc = pool.GetAccountByEmail(email)
+			var err error
+			acc, err = pool.FindByEmail(email)
+			if err != nil {
+				http.Error(w, `{"error":"email matches multiple workspaces; use account_id"}`, http.StatusConflict)
+				return
+			}
 		}
 
 		if acc == nil {

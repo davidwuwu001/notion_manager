@@ -113,11 +113,25 @@
 
   <div id="result" class="hidden">
     <div id="infoRows"></div>
+    <label for="workspaceSelect" style="display:block;margin-top:12px;font-size:13px;">选择要导入的工作区 / Workspace</label>
+    <select id="workspaceSelect" style="width:100%;margin-top:6px;padding:8px;background:#111;color:#fff;"></select>
     <div id="modelTags" class="models"></div>
-    <textarea id="configJson" readonly></textarea>
+    <button id="importBtn" class="btn-primary" disabled>一键导入本机账号池</button>
+    <div class="status info" id="importStatus" role="status" style="white-space: pre-line;">仅发送到 127.0.0.1:8081；只接受正式 Business Plan，试用不可导入。</div>
+    <button id="openDashboardBtn" class="btn-copy" hidden>打开控制面板</button>
+    <details style="margin-top:16px;font-size:12px;">
+    <summary>备用：导出 JSON 文件</summary>
+    <details style="margin-top:8px;font-size:12px;">
+      <summary>查看 JSON（含敏感登录凭据）</summary>
+      <textarea id="configJson" readonly></textarea>
+    </details>
+    <button id="exportBtn" class="btn-primary" disabled>下载账号 JSON 文件</button>
+    <p style="font-size:11px;color:#aaa;margin-top:6px;">JSON 含登录凭据，请妥善保管，勿分享或提交到 Git。到管理面板 → 添加账号 → 选择账号 JSON 文件。</p>
     <button id="copyBtn" class="btn-copy">📋 复制 JSON 配置</button>
+    </details>
   </div>
 
+  <script src="import.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

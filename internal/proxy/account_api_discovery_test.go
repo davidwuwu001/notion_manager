@@ -27,10 +27,14 @@ func stubAccountDiscovery(t *testing.T, responseBody string, inspect func(*http.
 			if inspect != nil {
 				inspect(req)
 			}
+			body := responseBody
+			if strings.HasSuffix(req.URL.Path, "/getFeatureBillingData") {
+				body = `{"billingData":{"type":"public","subscription":{"items":[{"price":{"product":"business"}}]}}}`
+			}
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     make(http.Header),
-				Body:       io.NopCloser(strings.NewReader(responseBody)),
+				Body:       io.NopCloser(strings.NewReader(body)),
 				Request:    req,
 			}, nil
 		})}
@@ -102,10 +106,11 @@ func TestHandleAddAccountUsesOptionalNotionUserID(t *testing.T) {
       "target-user": {"value":{"value":{"name":"Target","email":"target@example.com"}}}
     },
     "user_root": {
-      "target-user": {"value":{"value":{"space_view_pointers":[{"spaceId":"target-space","id":"target-view"}]}}}
+      "target-user": {"value":{"value":{"space_view_pointers":[{"spaceId":"target-space","id":"target-view"},{"spaceId":"other-space","id":"other-view"}]}}}
     },
     "space": {
-      "target-space": {"value":{"value":{"id":"target-space","name":"Target Space","plan_type":"team"}}}
+      "target-space": {"value":{"value":{"id":"target-space","name":"Same workspace name","plan_type":"team"}}},
+      "other-space": {"value":{"value":{"id":"other-space","name":"Same workspace name","plan_type":"team"}}}
     },
     "user_settings": {}
   }
@@ -118,7 +123,7 @@ func TestHandleAddAccountUsesOptionalNotionUserID(t *testing.T) {
 
 	pool := NewAccountPool()
 	request := httptest.NewRequest(http.MethodPost, "/admin/accounts/add", strings.NewReader(
-		`{"token_v2":"secret-token","notion_user_id":" target-user "}`,
+		`{"token_v2":"secret-token","notion_user_id":" target-user ","space_id":" target-space "}`,
 	))
 	recorder := httptest.NewRecorder()
 	HandleAddAccount(pool, t.TempDir(), NewDashboardAuth("", "")).ServeHTTP(recorder, request)
@@ -129,8 +134,19 @@ func TestHandleAddAccountUsesOptionalNotionUserID(t *testing.T) {
 	if pool.Count() != 1 {
 		t.Fatalf("pool count = %d, want 1", pool.Count())
 	}
-	if account := pool.GetByEmail("target@example.com"); account == nil || account.UserID != "target-user" {
+	if account := pool.GetByEmail("target@example.com"); account == nil || account.UserID != "target-user" || account.SpaceID != "target-space" {
 		t.Fatalf("imported account = %#v, want target-user", account)
+	}
+}
+
+func TestSameNameWorkspacesExposeDistinctIDs(t *testing.T) {
+	pool := NewAccountPool()
+	for _, id := range []string{"space-aaa", "space-bbb"} {
+		pool.AddAccount(&Account{UserID: "same-user", SpaceID: id, SpaceName: "Same workspace", UserName: "Same user"})
+	}
+	details := pool.GetAccountDetails()
+	if len(details) != 2 || details[0]["space_id"] == details[1]["space_id"] || details[0]["account_id"] == details[1]["account_id"] {
+		t.Fatalf("workspace identity lost: %v", details)
 	}
 }
 

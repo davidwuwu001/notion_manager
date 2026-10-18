@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,7 +29,7 @@ func UploadFileToNotion(acc *Account, file *FileAttachment) (*UploadedAttachment
 
 // UploadFileToNotionThread uploads a file into an explicit Notion thread.
 // createThread must only be true for the first attachment that initializes a thread.
-func UploadFileToNotionThread(acc *Account, file *FileAttachment, threadID string, createThread bool) (*UploadedAttachment, error) {
+func UploadFileToNotionThread(acc *Account, file *FileAttachment, threadID string, createThread bool, contexts ...context.Context) (*UploadedAttachment, error) {
 	if file == nil {
 		return nil, fmt.Errorf("file is required")
 	}
@@ -37,6 +38,11 @@ func UploadFileToNotionThread(acc *Account, file *FileAttachment, threadID strin
 	}
 
 	client := getChromeHTTPClient(30 * time.Second)
+	if len(contexts) > 0 {
+		copyClient := *client
+		copyClient.Transport = contextTransport{ctx: contexts[0], base: client.Transport}
+		client = &copyClient
+	}
 
 	// Generate UUID-based filename preserving original extension
 	ext := filepath.Ext(file.FileName)
@@ -254,6 +260,19 @@ func BuildAttachmentTranscript(uploaded *UploadedAttachment) AttachmentTranscrip
 
 // ── Internal helpers ──
 
+type contextTransport struct {
+	ctx  context.Context
+	base http.RoundTripper
+}
+
+func (t contextTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(r.Clone(t.ctx))
+}
+
 // notionAPICall makes a POST to a Notion API endpoint with JSON body and returns parsed response.
 func notionAPICall[T any](client *http.Client, acc *Account, endpoint string, body interface{}) (*T, error) {
 	raw, err := notionAPICallRaw(client, acc, endpoint, body)
@@ -295,8 +314,12 @@ func notionAPICallRaw(client *http.Client, acc *Account, endpoint string, body i
 
 // uploadToS3 uploads file data to S3 using presigned POST fields.
 // Uses a plain http.Client (not Chrome TLS) because S3 presigned POST requires HTTP/1.1.
-func uploadToS3(_ *http.Client, postURL string, fields map[string]string, data []byte, contentType string) error {
+func uploadToS3(client *http.Client, postURL string, fields map[string]string, data []byte, contentType string) error {
 	s3Client := &http.Client{Timeout: 30 * time.Second}
+	ctx := context.Background()
+	if t, ok := client.Transport.(contextTransport); ok {
+		ctx = t.ctx
+	}
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 
@@ -317,7 +340,7 @@ func uploadToS3(_ *http.Client, postURL string, fields map[string]string, data [
 	}
 	writer.Close()
 
-	req, err := http.NewRequest("POST", postURL, &buf)
+	req, err := http.NewRequestWithContext(ctx, "POST", postURL, &buf)
 	if err != nil {
 		return fmt.Errorf("create S3 request: %w", err)
 	}
@@ -343,7 +366,15 @@ func pollTaskCompletion(client *http.Client, acc *Account, taskID string, timeou
 	interval := 1 * time.Second
 
 	for time.Now().Before(deadline) {
-		time.Sleep(interval)
+		ctx := context.Background()
+		if t, ok := client.Transport.(contextTransport); ok {
+			ctx = t.ctx
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(interval):
+		}
 
 		tasksReq := NotionGetTasksRequest{TaskIDs: []string{taskID}}
 		raw, err := notionAPICallRaw(client, acc, "/getTasks", tasksReq)

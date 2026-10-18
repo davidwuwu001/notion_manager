@@ -2,9 +2,11 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -244,6 +246,7 @@ func HandleAdminModels(pool *AccountPool, auth *DashboardAuth) http.HandlerFunc 
 		resp := map[string]interface{}{
 			"model_map":        SnapshotModelMap(),
 			"available_models": pool.AllModels(),
+			"public_models":    buildPublicModels(pool.AllModels()),
 		}
 		json.NewEncoder(w).Encode(resp)
 	}
@@ -268,11 +271,14 @@ func HandleAdminSettings(configPath string, auth *DashboardAuth) http.HandlerFun
 				"enable_workspace_search": AppConfig.WorkspaceSearchEnabled(),
 				"ask_mode_default":        AppConfig.AskModeDefault(),
 				"disable_notion_prompt":   AppConfig.Proxy.DisableNotionPrompt,
-				"debug_logging":           AppConfig.Server.DebugLogging,
+				"debug_logging":           DebugLoggingEnabled(),
 				"notion_proxy":            AppConfig.NotionProxyURL(),
 			})
 
 		case "PUT":
+			dashboardSettingsWriteMu.Lock()
+			defer dashboardSettingsWriteMu.Unlock()
+			nextConfig := *effectiveDashboardConfig(AppConfig)
 			var body struct {
 				EnableWebSearch       *bool   `json:"enable_web_search"`
 				EnableWorkspaceSearch *bool   `json:"enable_workspace_search"`
@@ -284,27 +290,33 @@ func HandleAdminSettings(configPath string, auth *DashboardAuth) http.HandlerFun
 				http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
 				return
 			}
+			if body.NotionProxy != nil {
+				next := strings.TrimSpace(*body.NotionProxy)
+				if next != "" && netutil.ValidateProxyURL(next) != nil {
+					http.Error(w, `{"error":"unsupported proxy scheme (want http/https/socks5)"}`, 400)
+					return
+				}
+			}
 
 			changed := false
 			rebuildTransport := false
 			if body.EnableWebSearch != nil {
-				AppConfig.Proxy.EnableWebSearch = body.EnableWebSearch
+				nextConfig.Proxy.EnableWebSearch = body.EnableWebSearch
 				changed = true
 				log.Printf("[settings] enable_web_search → %v", *body.EnableWebSearch)
 			}
 			if body.EnableWorkspaceSearch != nil {
-				AppConfig.Proxy.EnableWorkspaceSearch = body.EnableWorkspaceSearch
+				nextConfig.Proxy.EnableWorkspaceSearch = body.EnableWorkspaceSearch
 				changed = true
 				log.Printf("[settings] enable_workspace_search → %v", *body.EnableWorkspaceSearch)
 			}
 			if body.AskModeDefault != nil {
-				AppConfig.Proxy.AskModeDefault = body.AskModeDefault
+				nextConfig.Proxy.AskModeDefault = body.AskModeDefault
 				changed = true
 				log.Printf("[settings] ask_mode_default → %v", *body.AskModeDefault)
 			}
 			if body.DebugLogging != nil {
-				AppConfig.Server.DebugLogging = *body.DebugLogging
-				SetDebugLoggingEnabled(*body.DebugLogging)
+				nextConfig.Server.DebugLogging = *body.DebugLogging
 				changed = true
 				log.Printf("[settings] debug_logging → %v", *body.DebugLogging)
 			}
@@ -319,8 +331,8 @@ func HandleAdminSettings(configPath string, auth *DashboardAuth) http.HandlerFun
 						return
 					}
 				}
-				if AppConfig.Proxy.NotionProxy != next {
-					AppConfig.Proxy.NotionProxy = next
+				if nextConfig.Proxy.NotionProxy != next {
+					nextConfig.Proxy.NotionProxy = next
 					changed = true
 					rebuildTransport = true
 					if next == "" {
@@ -333,8 +345,13 @@ func HandleAdminSettings(configPath string, auth *DashboardAuth) http.HandlerFun
 
 			// Persist to config.yaml
 			if changed && configPath != "" {
-				persistSearchSettings(configPath)
+				if err := persistSearchSettings(configPath, &nextConfig); err != nil {
+					http.Error(w, `{"error":"settings could not be saved; no changes applied"}`, http.StatusInternalServerError)
+					return
+				}
 			}
+			dashboardRuntimeConfig.Store(&dashboardConfigOverride{original: AppConfig, config: &nextConfig})
+			SetDebugLoggingEnabled(nextConfig.Server.DebugLogging)
 
 			// Drop idle pooled connections so the next notion dial picks
 			// up the new upstream proxy. Active in-flight requests
@@ -348,7 +365,7 @@ func HandleAdminSettings(configPath string, auth *DashboardAuth) http.HandlerFun
 				"enable_workspace_search": AppConfig.WorkspaceSearchEnabled(),
 				"ask_mode_default":        AppConfig.AskModeDefault(),
 				"disable_notion_prompt":   AppConfig.Proxy.DisableNotionPrompt,
-				"debug_logging":           AppConfig.Server.DebugLogging,
+				"debug_logging":           DebugLoggingEnabled(),
 				"notion_proxy":            AppConfig.NotionProxyURL(),
 			})
 
@@ -359,38 +376,57 @@ func HandleAdminSettings(configPath string, auth *DashboardAuth) http.HandlerFun
 }
 
 // persistSearchSettings writes the current dashboard settings back to config.yaml.
-func persistSearchSettings(configPath string) {
+func persistSearchSettings(configPath string, configs ...*Config) error {
+	cfg := AppConfig
+	if len(configs) > 0 {
+		cfg = configs[0]
+	}
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		log.Printf("[settings] failed to read %s: %v", configPath, err)
-		return
+		return err
 	}
 	var root yaml.Node
 	if err := yaml.Unmarshal(data, &root); err != nil || root.Kind == 0 {
 		log.Printf("[settings] failed to parse %s: %v", configPath, err)
-		return
+		return fmt.Errorf("invalid config YAML")
 	}
 
 	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
 		mapping := root.Content[0]
 		proxyNode := getOrCreateYAMLMapping(mapping, "proxy")
-		setYAMLBool(proxyNode, "enable_web_search", AppConfig.WebSearchEnabled())
-		setYAMLBool(proxyNode, "enable_workspace_search", AppConfig.WorkspaceSearchEnabled())
-		setYAMLBool(proxyNode, "ask_mode_default", AppConfig.AskModeDefault())
-		setYAMLString(proxyNode, "notion_proxy", AppConfig.Proxy.NotionProxy)
+		setYAMLBool(proxyNode, "enable_web_search", cfg.WebSearchEnabled())
+		setYAMLBool(proxyNode, "enable_workspace_search", cfg.WorkspaceSearchEnabled())
+		setYAMLBool(proxyNode, "ask_mode_default", cfg.AskModeDefault())
+		setYAMLString(proxyNode, "notion_proxy", cfg.Proxy.NotionProxy)
 
 		serverNode := getOrCreateYAMLMapping(mapping, "server")
-		setYAMLBool(serverNode, "debug_logging", AppConfig.Server.DebugLogging)
+		setYAMLBool(serverNode, "debug_logging", cfg.Server.DebugLogging)
 	}
 
 	out, err := yaml.Marshal(&root)
 	if err != nil {
 		log.Printf("[settings] failed to marshal config: %v", err)
-		return
+		return err
 	}
-	if err := os.WriteFile(configPath, out, 0644); err != nil {
-		log.Printf("[settings] failed to write %s: %v", configPath, err)
+	file, err := os.CreateTemp(filepath.Dir(configPath), ".settings-*.tmp")
+	if err != nil {
+		return err
 	}
+	defer os.Remove(file.Name())
+	if err = file.Chmod(0600); err == nil {
+		_, err = file.Write(out)
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), configPath)
 }
 
 func getOrCreateYAMLMapping(mapping *yaml.Node, key string) *yaml.Node {
@@ -461,19 +497,5 @@ func setYAMLString(mapping *yaml.Node, key, value string) {
 // isFreePlan returns true if the account is on a free plan where basic credits (200 lifetime)
 // never reset. Paid plans (plus, business, enterprise) have monthly premium credits that reset.
 func isFreePlan(acc *Account) bool {
-	quota := acc.quotaInfoSnapshot()
-	if quota != nil && (quota.HasPremium || quota.PremiumLimit > 0 || quota.PremiumBalance > 0) {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(acc.PlanType)) {
-	case "personal", "free", "":
-		return true
-	default:
-		// For team plans, check if they actually have a paid subscription
-		// by looking at quota info — if no premium credits exist, treat as free.
-		if quota != nil && !quota.HasPremium {
-			return true
-		}
-		return false
-	}
+	return accountIsLifetimeFree(acc, acc.quotaInfoSnapshot())
 }

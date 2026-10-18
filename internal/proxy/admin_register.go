@@ -17,19 +17,19 @@ import (
 
 // HandleAdminRegister returns the /admin/register HTTP handler. It accepts:
 //
-//   POST /admin/register
-//   Content-Type: application/json
-//   { "input": "<bulk credentials text>" }
+//	POST /admin/register
+//	Content-Type: application/json
+//	{ "input": "<bulk credentials text>" }
 //
 // or
 //
-//   POST /admin/register
-//   Content-Type: text/plain
-//   <bulk credentials text>
+//	POST /admin/register
+//	Content-Type: text/plain
+//	<bulk credentials text>
 //
 // Each non-blank line must follow the format
 //
-//   <email>----<password>----<client_id>----<refresh_token>
+//	<email>----<password>----<client_id>----<refresh_token>
 //
 // The handler walks the list, drives the Microsoft SSO + Notion onboarding
 // flow per account using the N → N+1 backup strategy for MS proofs, writes
@@ -38,11 +38,15 @@ import (
 //
 // The response is a JSON summary of per-line outcomes, suitable for direct
 // rendering in a future dashboard UI.
-func HandleAdminRegister(pool *AccountPool, accountsDir string, auth *DashboardAuth) http.HandlerFunc {
+func HandleAdminRegister(pool *AccountPool, accountsDir string, auth *DashboardAuth, businessOnly ...bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if auth.HasAdminPassword() && !auth.ValidateSession(r) {
 			http.Error(w, `{"error":"unauthorized, dashboard login required"}`, http.StatusUnauthorized)
+			return
+		}
+		if len(businessOnly) > 0 && businessOnly[0] {
+			rejectFreeRegistration(w)
 			return
 		}
 		if r.Method != http.MethodPost {
@@ -93,6 +97,10 @@ func HandleAdminRegister(pool *AccountPool, accountsDir string, auth *DashboardA
 }
 
 // readRegisterBody pulls bulk credentials from either a JSON {"input":"..."}
+func rejectFreeRegistration(w http.ResponseWriter) {
+	http.Error(w, `{"error":"Only verified Business accounts can be imported; automatic registration and retries are disabled."}`, http.StatusConflict)
+}
+
 // envelope or a raw text/plain body.
 func readRegisterBody(r *http.Request) (string, error) {
 	defer r.Body.Close()

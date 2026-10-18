@@ -131,13 +131,14 @@ func TestAccountQuotaPriorityFoldsPremium(t *testing.T) {
 	premiumLowBasic := &Account{
 		UserEmail: "premium@example.com",
 		QuotaInfo: &QuotaInfo{
-			IsEligible:     true,
-			HasPremium:     true,
-			PremiumBalance: 10000,
-			SpaceLimit:     200,
-			SpaceUsage:     190,
-			UserLimit:      200,
-			UserUsage:      190, // basic remaining only 10
+			IsEligible:          true,
+			HasPremium:          true,
+			PremiumBalance:      10000,
+			PremiumBalanceKnown: true,
+			SpaceLimit:          200,
+			SpaceUsage:          190,
+			UserLimit:           200,
+			UserUsage:           190, // basic remaining only 10
 		},
 	}
 

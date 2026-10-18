@@ -17,6 +17,7 @@ export function AccountMenu({ account, onChanged }: Props) {
   const [open, setOpen] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [confirming, setConfirming] = useState(false)
+  const [error, setError] = useState('')
   const wrapRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -54,15 +55,16 @@ export function AccountMenu({ account, onChanged }: Props) {
       return
     }
     setDeleting(true)
+    setError('')
     try {
       await deleteAccount(account.account_id)
       onChanged()
-    } catch (err) {
-      console.error('delete account failed', err)
-    } finally {
-      setDeleting(false)
       setOpen(false)
       setConfirming(false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('upgrade.action_failed'))
+    } finally {
+      setDeleting(false)
     }
   }
 
@@ -92,6 +94,7 @@ export function AccountMenu({ account, onChanged }: Props) {
             icon={<IconTrash size={13} />}
             label={confirming ? t('menu.confirm_delete') : t('menu.delete_account')}
           />
+          {error && <p role="alert" className="text-err text-[11px] px-3 py-2 break-words">{error}</p>}
         </div>
       )}
     </div>

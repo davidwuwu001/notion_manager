@@ -17,10 +17,12 @@ web/
 ├── tsconfig.json       # TypeScript config
 └── src/
     ├── main.tsx        # React root mount
-    ├── App.tsx         # Main dashboard component (Header, Summary, Grid)
+    ├── App.tsx         # Auth, six-page hash navigation, account pool
     ├── api.ts          # API calls (/admin/accounts, /proxy/start)
     ├── types.ts        # TypeScript interfaces (AccountInfo, DashboardData, Model)
     ├── utils.ts        # Helpers (avatarColor, quota status, formatting)
+    ├── dashboard.ts    # Navigation, filter and nullable metric helpers
+    ├── components/     # Overview, logs, analytics, settings and models
     ├── index.css       # TailwindCSS imports + theme variables
     └── vite-env.d.ts   # Vite type reference
 ```
@@ -31,8 +33,11 @@ web/
 # Development (hot reload, proxies API to localhost:8081)
 cd web && npm run dev
 
-# Production build
-make web          # builds frontend + copies to internal/web/dist/
+# Portable frontend build (does not replace the running service)
+npm run build
+
+# Windows build helpers
+make web          # uses Windows cmd/xcopy to copy into internal/web/dist/
 make build        # builds frontend + Go binary
 make build-go     # Go binary only (uses existing internal/web/dist/)
 ```
@@ -41,7 +46,38 @@ The build pipeline:
 1. `npm run build` → `web/dist/`
 2. `xcopy web/dist internal/web/dist/` (embedded into Go binary)
 3. `go build` with `//go:embed dist/*` in `internal/web/embed.go`
-4. Go serves at `/dashboard/` with API key injected into `<meta name="api-key">`
+4. Go serves at `/dashboard/`; management calls use the dashboard session.
+5. Public model IDs come from `/admin/models.public_models`, matching `/v1/models`.
+6. The API key is read only after an explicit show/copy action via the protected
+   `/admin/connection` endpoint. Never read credentials from HTML metadata.
+
+On macOS/Linux, use the project release workflow for the embed copy and Go
+build; the Windows Makefile copy commands are not portable. A Vite build alone
+does not update the embedded or running app.
+
+## Pages and New Management Contracts
+
+Use `/dashboard/#overview`, `#accounts` (default), `#models`, `#logs`,
+`#analytics`, `#settings`; no router dependency is needed. Each new panel owns
+its loading/error state and aborts reads when unmounted. A 401 expires the
+dashboard session. Never display failed reads as successful zero metrics.
+
+- `/admin/request-logs`: stable cursor pagination; metadata filters only.
+- `/admin/request-logs/{id}`: direct request and attempt lookup.
+- `/admin/analytics`: request counts, successful-request latency and coverage.
+- `/admin/routing`: quota/round_robin, enabled pool members, attempt budget,
+  per-account concurrency and request-log retention. No primary/backup roles.
+- `/admin/stats`: original historical Token totals, kept independent.
+
+Unknown metrics use `—`. Explain collection/retention coverage separately from
+storage degradation. Account distribution counts participating requests per
+account and attempt outcomes; rows must not be summed as global requests.
+Only verified non-trial Business workspaces may be added. Preserve Chrome,
+JSON and token import; old registration history is read-only.
+
+Pure logic and management-contract checks use the existing Node test runner:
+`node --test web/src/*.test.mjs` from the repository root. Type-check and build
+with `npm --prefix web run build`; verify the actual Go-served app separately.
 
 ## Design System
 
@@ -112,7 +148,7 @@ Research mode is available on **paid plans only** (`plus`, `business`, `enterpri
 ### Data Source
 
 The dashboard fetches from `GET /admin/accounts` with the dashboard
-session cookie (or `Authorization: Bearer <api-key>`).
+session cookie. New management APIs never use a public API key.
 
 Pagination params (all optional): `?q=<substr>&page=<n>&page_size=<n>`.
 - Without any params, the response is the full unsorted list (legacy
@@ -165,13 +201,13 @@ Response shape:
 
 ### Proxy Navigation
 
-- Click account card → `GET /proxy/start?email=<email>` (opens in new tab)
+- Click account card → `GET /proxy/start?account_id=<id>` (opens in new tab)
 - "Open Best" button → `GET /proxy/start?best=true`
 - Both create a `np_session` cookie and redirect to `/ai` (Notion reverse proxy)
 
 ## Conventions
 
-- All component code lives in `App.tsx` (single-file for now; split when it grows)
+- Keep the existing account view in `App.tsx`; new page components live in `components/`.
 - No external UI library — TailwindCSS utility classes only
 - Responsive: 5-col summary grid → 2-col on tablet → 1-col on mobile
 - Account cards sorted server-side: healthy (most remaining first), then

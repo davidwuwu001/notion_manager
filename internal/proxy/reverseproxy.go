@@ -241,7 +241,12 @@ func isAllowedNotionRedirectHost(host string) bool {
 func (rp *ReverseProxy) getSession(r *http.Request) *ProxySession {
 	if c, err := r.Cookie("np_session"); err == nil {
 		if s, ok := rp.sessions.Load(c.Value); ok {
-			return s.(*ProxySession)
+			session := s.(*ProxySession)
+			if rp.pool.FindByAccountID(session.Account.AccountID) != session.Account {
+				rp.sessions.Delete(c.Value)
+				return nil
+			}
+			return session
 		}
 	}
 	return nil

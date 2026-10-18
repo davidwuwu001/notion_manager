@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -62,9 +63,10 @@ func triggerPostRegisterRefresh(deps *RegisterJobsDeps, email string) {
 // and /admin/accounts/{email} handlers. We pass the bundle by pointer so
 // main.go owns a single instance that survives across requests.
 type RegisterJobsDeps struct {
-	Pool        *AccountPool
-	AccountsDir string
-	Store       regjob.Store
+	BusinessOnly bool
+	Pool         *AccountPool
+	AccountsDir  string
+	Store        regjob.Store
 	// Providers is the registry of Provider implementations available to
 	// HandleAdminRegisterStart. Required.
 	Providers *providers.Registry
@@ -124,6 +126,10 @@ func HandleAdminRegisterStart(deps *RegisterJobsDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if !deps.authorize(w, r) {
+			return
+		}
+		if deps.BusinessOnly {
+			rejectFreeRegistration(w)
 			return
 		}
 		if r.Method != http.MethodPost {
@@ -372,6 +378,10 @@ func serveJobDelete(deps *RegisterJobsDeps, id string, w http.ResponseWriter, r 
 // intact) and respond with the new job id.
 func serveJobRetry(deps *RegisterJobsDeps, id string, w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if deps.BusinessOnly {
+		rejectFreeRegistration(w)
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
@@ -610,7 +620,7 @@ func HandleAdminDeleteAccount(deps *RegisterJobsDeps) http.HandlerFunc {
 		// otherwise fall back to email for backward compatibility.
 		if isAccountID(identifier) {
 			if err := deleteAccountByID(deps.Pool, deps.AccountsDir, identifier); err != nil {
-				if os.IsNotExist(err) {
+				if errors.Is(err, os.ErrNotExist) {
 					http.Error(w, `{"error":"account not found"}`, http.StatusNotFound)
 					return
 				}
@@ -620,7 +630,12 @@ func HandleAdminDeleteAccount(deps *RegisterJobsDeps) http.HandlerFunc {
 			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "deleted": identifier})
 		} else {
 			if err := deleteAccountByEmail(deps.Pool, deps.AccountsDir, identifier); err != nil {
-				if os.IsNotExist(err) {
+				var ambiguous *AmbiguousEmailError
+				if errors.As(err, &ambiguous) {
+					http.Error(w, `{"error":"email matches multiple workspaces; use account_id"}`, http.StatusConflict)
+					return
+				}
+				if errors.Is(err, os.ErrNotExist) {
 					http.Error(w, `{"error":"account not found"}`, http.StatusNotFound)
 					return
 				}
@@ -636,39 +651,24 @@ func HandleAdminDeleteAccount(deps *RegisterJobsDeps) http.HandlerFunc {
 // matches and drops the corresponding pool entry. Returns os.ErrNotExist if
 // no file matches; that's mapped to a 404 by the handler.
 func deleteAccountByEmail(pool *AccountPool, dir, email string) error {
-	entries, err := readPrivateAccountsDir(dir)
-	if err != nil {
-		return err
-	}
-	var target string
-	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
-			continue
-		}
-		path := filepath.Join(dir, e.Name())
-		data, err := readPrivateAccountFile(path)
-		if err != nil {
+	var acc *Account
+	if pool != nil {
+		var err error
+		acc, err = pool.FindByEmail(email)
+		var ambiguous *AmbiguousEmailError
+		if errors.As(err, &ambiguous) {
 			return err
 		}
-		var raw map[string]interface{}
-		if err := json.Unmarshal(data, &raw); err != nil {
-			continue
-		}
-		if got, _ := raw["user_email"].(string); strings.EqualFold(got, email) {
-			target = path
-			break
-		}
 	}
-	if target == "" {
-		return os.ErrNotExist
-	}
-	if err := os.Remove(target); err != nil {
+	if err := DeleteAccountFileByEmail(email, dir); err != nil {
 		return err
 	}
 	if pool != nil {
 		pool.RemoveAccountByEmail(email)
 	}
-	log.Printf("[admin] deleted account file: %s (%s)", target, email)
+	if acc != nil {
+		globalSessionManager.DeleteByAccountID(acc.AccountID)
+	}
 	return nil
 }
 
@@ -728,6 +728,7 @@ func deleteAccountByID(pool *AccountPool, dir, accountID string) error {
 	if pool != nil {
 		pool.RemoveAccountByAccountID(accountID)
 	}
+	globalSessionManager.DeleteByAccountID(accountID)
 	log.Printf("[admin] deleted account file by account_id: %s", target)
 	return nil
 }
