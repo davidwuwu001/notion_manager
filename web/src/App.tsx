@@ -15,6 +15,7 @@ import { LogsPanel } from './components/LogsPanel'
 import { AnalyticsPanel } from './components/AnalyticsPanel'
 import { SettingsPanel } from './components/SettingsPanel'
 import { ResourceState, buttonClass } from './components/DashboardShared'
+import { startVisiblePolling } from './polling'
 
 // --- Icons ---
 const IconBarChart = () => (
@@ -475,6 +476,16 @@ function AIUsage({ account }: { account: AccountInfo }) {
   return (
     <section className="my-3 rounded-md border border-border bg-bg-card p-3" aria-label={t('ai_usage.title')}>
       <div className="text-[12px] font-semibold mb-2">{t('ai_usage.title')}</div>
+      {account.quota_sources && <div className="space-y-1 mb-2 text-[10px] text-text-secondary">
+        {(['basic', 'premium', 'allowance'] as const).map(source => {
+          const state = account.quota_sources?.[source]
+          if (!state) return null
+          return <div key={source}>
+            {t(`quota.source_${source}`)} · {t('quota.last_success', { time: timestampValue(state.succeeded_at_ms) })}
+            {state.error && <p role="status" className="text-warn">{t('quota.source_failed', { time: timestampValue(state.checked_at_ms) })}</p>}
+          </div>
+        })}
+      </div>}
       {account.rate_limit_error && <p role="status" className="text-[11px] text-warn mb-2">{t('quota.rate_read_failed')}</p>}
       {!rate && <p className="text-[11px] text-text-secondary">{t('ai_usage.unavailable')}</p>}
       {windows.map(w => w.limit > 0 ? (
@@ -707,6 +718,7 @@ export default function App() {
   const [refreshTime, setRefreshTime] = useState('')
   const [page, setPage] = useState(0)
   const [tokenStats, setTokenStats] = useState<TokenStats | null>(null)
+  const [tokenStatsError, setTokenStatsError] = useState('')
   const [routing, setRouting] = useState<RoutingData | null>(null)
   const [routingError, setRoutingError] = useState('')
   const [memberSaving, setMemberSaving] = useState('')
@@ -736,7 +748,7 @@ export default function App() {
   useEffect(() => {
     const expired = () => {
       accountRequest.current?.abort()
-      setAuthState(authRequired ? 'login' : 'checking'); setData(null); setRouting(null); setTokenStats(null); setShowAddModal(false)
+      setAuthState(authRequired ? 'login' : 'checking'); setData(null); setRouting(null); setTokenStats(null); setTokenStatsError(''); setShowAddModal(false)
       if (!authRequired) setAuthVersion(value => value + 1)
     }
     window.addEventListener('notion-manager-unauthorized', expired)
@@ -750,37 +762,41 @@ export default function App() {
     return () => clearTimeout(timer)
   }, [query])
 
-  const loadData = useCallback(async () => {
+  const loadData = useCallback(async (signal?: AbortSignal) => {
     accountRequest.current?.abort()
     const controller = new AbortController()
     accountRequest.current = controller
-    setLoading(true)
+    const requestSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
     try {
-      const result = await fetchDashboardData({ page, pageSize: PAGE_SIZE, query: debouncedQuery }, controller.signal)
-      if (controller.signal.aborted) return
+      const result = await fetchDashboardData({ page, pageSize: PAGE_SIZE, query: debouncedQuery }, requestSignal)
+      if (requestSignal.aborted) return
       setData(result); setError('')
       setRefreshStatus(result.refresh || null)
       setRefreshTime(new Date().toLocaleTimeString(i18n.language === 'zh' ? 'zh-CN' : 'en-US'))
     } catch (reason) {
-      if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : String(reason))
-    } finally { if (!controller.signal.aborted) setLoading(false) }
+      if (!requestSignal.aborted) setError(reason instanceof Error ? reason.message : String(reason))
+    } finally { if (!requestSignal.aborted) setLoading(false) }
   }, [page, debouncedQuery, i18n.language])
 
   useEffect(() => {
     if (authState !== 'authenticated' || activeTab !== 'accounts') return
-    void loadData()
-    return () => { accountRequest.current?.abort() }
-  }, [authState, activeTab, loadData, importVersion])
+    setLoading(true)
+    const stop = startVisiblePolling(loadData, refreshStatus?.refreshing ? 3000 : 10000)
+    return () => { stop(); accountRequest.current?.abort() }
+  }, [authState, activeTab, loadData, importVersion, refreshStatus?.refreshing])
 
   useEffect(() => {
     if (authState !== 'authenticated' || activeTab !== 'accounts') return
-    const controller = new AbortController()
-    setTokenStats(null)
-    fetchTokenStats(controller.signal).then(value => { if (!controller.signal.aborted) setTokenStats(value) }).catch(() => {})
-    fetchRouting(controller.signal).then(value => { if (!controller.signal.aborted) { setRouting(value); setRoutingError('') } }).catch(reason => {
-      if (!controller.signal.aborted) setRoutingError(reason instanceof Error ? reason.message : String(reason))
-    })
-    return () => controller.abort()
+    return startVisiblePolling(async signal => {
+      await Promise.all([
+        fetchTokenStats(signal).then(value => { if (!signal.aborted) { setTokenStats(value); setTokenStatsError('') } }).catch(reason => {
+          if (!signal.aborted) setTokenStatsError(reason instanceof Error ? reason.message : String(reason))
+        }),
+        fetchRouting(signal).then(value => { if (!signal.aborted) { setRouting(value); setRoutingError('') } }).catch(reason => {
+          if (!signal.aborted) setRoutingError(reason instanceof Error ? reason.message : String(reason))
+        }),
+      ])
+    }, 10000)
   }, [authState, activeTab, importVersion, routingVersion])
 
   useEffect(() => {
@@ -792,12 +808,6 @@ export default function App() {
     quotaRefreshPending.current = next.pending
     if (next.completed) setRoutingVersion(value => value + 1)
   }, [authState, activeTab, refreshStatus])
-
-  useEffect(() => {
-    if (authState !== 'authenticated' || activeTab !== 'accounts' || !refreshStatus?.refreshing) return
-    const interval = setInterval(() => { void loadData() }, 3000)
-    return () => clearInterval(interval)
-  }, [authState, activeTab, refreshStatus?.refreshing, loadData])
 
   const refresh = async () => { setRefreshing(true); setRoutingVersion(value => value + 1); await loadData(); setRefreshing(false) }
   const handleQuotaRefresh = async () => {
@@ -828,7 +838,7 @@ export default function App() {
     try {
       await logout()
       accountRequest.current?.abort()
-      setAuthState('login'); setData(null); setTokenStats(null); setRouting(null); setShowAddModal(false)
+      setAuthState('login'); setData(null); setTokenStats(null); setTokenStatsError(''); setRouting(null); setShowAddModal(false)
     } catch (reason) { setAuthError(reason instanceof Error ? reason.message : String(reason)) }
   }
 
@@ -871,6 +881,10 @@ export default function App() {
         <h1 className="text-xl font-semibold mb-4">{t('upgrade.accounts')}</h1>
         <ResourceState loading={loading && !data} error={error} retry={() => { void loadData() }} />
         {routingError && <p role="alert" className="text-err text-sm mb-4 break-words">{routingError}</p>}
+        {tokenStatsError && <p role="alert" className="text-warn text-sm mb-4 break-words">
+          {t('stats.read_failed', { error: tokenStatsError })} {t(tokenStats ? 'stats.cached_usage' : 'stats.unavailable')}
+          <button className={`${buttonClass} ml-2`} onClick={() => setRoutingVersion(value => value + 1)}>{t('upgrade.retry')}</button>
+        </p>}
         {routing && <div className="text-[12px] text-text-secondary border border-border rounded-lg p-3 mb-4">{t('upgrade.pool_summary', routing as unknown as Record<string, unknown>)} · {t(`upgrade.mode_${routing.mode}`)}</div>}
         {/* Summary */}
         {summary && (
@@ -903,7 +917,7 @@ export default function App() {
               value={tokenStats ? formatTokens(tokenStats.total.total) : '—'}
               sub={tokenStats
                 ? t('stats.today_usage', { today: formatTokens(tokenStats.today.total), input: formatTokens(tokenStats.today.input), output: formatTokens(tokenStats.today.output) })
-                : t('stats.no_usage')}
+                : t(tokenStatsError ? 'stats.unavailable' : 'upgrade.loading')}
               color="var(--color-notion-blue)"
             />
           </div>

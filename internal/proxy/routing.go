@@ -63,14 +63,17 @@ type RoutingStatus struct {
 }
 
 type routingRuntime struct {
-	inFlight          int
-	account           *Account
-	reason            string
-	until             time.Time
-	recheckAt         time.Time
-	rechecking        bool
-	models            map[string]bool
-	researchExhausted bool
+	inFlight            int
+	account             *Account
+	reason              string
+	until               time.Time
+	recheckAt           time.Time
+	rechecking          bool
+	failureGeneration   uint64
+	failureAt           time.Time
+	models              map[string]bool
+	researchExhausted   bool
+	researchExhaustedAt time.Time
 }
 
 func normalizedRoutingConfig(config RoutingConfig) (RoutingConfig, error) {
@@ -185,6 +188,8 @@ func (p *AccountPool) SelectForRequest(model string, research bool, excluded map
 		score, _ := routingQuotaScore(acc)
 		if config.Mode == "round_robin" {
 			score = 0
+		} else if score >= 0 {
+			score /= float64(state.inFlight + 1)
 		}
 		if len(candidates) == 0 || score > bestScore {
 			candidates = []*Account{acc}
@@ -240,10 +245,15 @@ func (p *AccountPool) SetRoutingFailure(accountID, model, reason string, until t
 		state.models[ResolveModel(model)] = true
 	case "research_exhausted":
 		state.researchExhausted = true
+		state.researchExhaustedAt = time.Now()
 	case "invalid_credentials":
+		state.failureGeneration++
+		state.failureAt = time.Now()
 		state.reason = reason
 		state.until = time.Time{}
 	case "rate_limited", "transient":
+		state.failureGeneration++
+		state.failureAt = time.Now()
 		state.reason = reason
 		if until.IsZero() {
 			until = time.Now().Add(5 * time.Second)
@@ -253,21 +263,23 @@ func (p *AccountPool) SetRoutingFailure(accountID, model, reason string, until t
 	}
 }
 
-func (p *AccountPool) routingQuotaUpdated(acc *Account, info *QuotaInfo) {
-	if info == nil {
+func (p *AccountPool) routingQuotaUpdated(acc *Account, update *QuotaInfo, started time.Time) {
+	if update == nil {
 		return
 	}
+	info := acc.quotaInfoSnapshot()
 	p.routingMu.Lock()
 	defer p.routingMu.Unlock()
 	state := p.routingStates[acc.AccountID]
 	if state == nil || state.account != acc {
 		return
 	}
-	if info.HasPremium || info.ResearchModeUsage < 3 {
+	if quotaSourceSucceeded(update, "basic") && started.After(state.researchExhaustedAt) && info.IsEligible && info.ResearchModeUsage < 3 {
 		state.researchExhausted = false
+		state.researchExhaustedAt = time.Time{}
 	}
 	blocked, _ := routingAllowanceBlocked(info)
-	if info.IsEligible && !blocked && !state.until.After(time.Now()) && (state.reason == "rate_limited" || state.reason == "transient") {
+	if quotaSourceSucceeded(update, "basic") && started.After(state.failureAt) && info.IsEligible && !blocked && !state.until.After(time.Now()) && (state.reason == "rate_limited" || state.reason == "transient") {
 		state.reason = ""
 		state.until = time.Time{}
 		state.recheckAt = time.Time{}
@@ -475,23 +487,28 @@ func (p *AccountPool) recheckRoutingAccounts(accounts []*Account) {
 			continue
 		}
 		state.rechecking = true
+		generation := state.failureGeneration
 		p.routingMu.Unlock()
-		info, err := quotaFetcher(acc)
-		if err == nil && info != nil {
-			p.applyQuotaInfo(acc, info)
-		}
-		p.routingMu.Lock()
-		state.rechecking = false
-		if state.account == acc {
-			stillBlocked, _ := routingAllowanceBlocked(info)
-			if err == nil && info != nil && info.IsEligible && !stillBlocked {
-				state.reason = ""
-				state.until = time.Time{}
-				state.recheckAt = time.Time{}
-			} else {
-				state.recheckAt = time.Now().Add(5 * time.Second)
+		flight := p.startQuotaRefresh(acc)
+		go func(acc *Account, state *routingRuntime, flight *quotaFlight, generation uint64) {
+			<-flight.done
+			info := acc.quotaInfoSnapshot()
+			p.routingMu.Lock()
+			defer p.routingMu.Unlock()
+			if state.account == acc {
+				state.rechecking = false
+				if state.failureGeneration != generation || !flight.started.After(state.failureAt) {
+					return
+				}
+				stillBlocked, _ := routingAllowanceBlocked(info)
+				if flight.err == nil && quotaSourceSucceeded(flight.info, "basic") && info.IsEligible && !stillBlocked {
+					state.reason = ""
+					state.until = time.Time{}
+					state.recheckAt = time.Time{}
+				} else {
+					state.recheckAt = time.Now().Add(5 * time.Second)
+				}
 			}
-		}
-		p.routingMu.Unlock()
+		}(acc, state, flight, generation)
 	}
 }

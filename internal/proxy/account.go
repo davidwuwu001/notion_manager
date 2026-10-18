@@ -127,12 +127,20 @@ type AccountPool struct {
 	// Per-account live quota refresh state (key: account pointer)
 	// Used to deduplicate concurrent live quota checks for the same account.
 	liveQuotaMu       sync.Mutex
-	liveQuotaInflight map[*Account]bool
+	liveQuotaInflight map[*Account]*quotaFlight
+}
+
+type quotaFlight struct {
+	done    chan struct{}
+	started time.Time
+	info    *QuotaInfo
+	err     error
+	result  quotaApplyResult
 }
 
 func NewAccountPool() *AccountPool {
 	return &AccountPool{
-		liveQuotaInflight: make(map[*Account]bool),
+		liveQuotaInflight: make(map[*Account]*quotaFlight),
 	}
 }
 
@@ -167,6 +175,12 @@ func cloneQuotaInfo(src *QuotaInfo) *QuotaInfo {
 		return nil
 	}
 	dst := *src
+	if src.Sources != nil {
+		dst.Sources = make(map[string]QuotaSourceStatus, len(src.Sources))
+		for name, status := range src.Sources {
+			dst.Sources[name] = status
+		}
+	}
 	if src.RateLimit != nil {
 		limit := *src.RateLimit
 		dst.RateLimit = &limit
@@ -683,18 +697,33 @@ type quotaApplyResult struct {
 // The returned snapshot describes what changed so the caller can log the
 // transition without re-locking.
 func (p *AccountPool) applyQuotaInfo(acc *Account, info *QuotaInfo) quotaApplyResult {
+	return p.applyQuotaInfoSince(acc, info, time.Now())
+}
+
+func (p *AccountPool) applyQuotaInfoSince(acc *Account, info *QuotaInfo, started time.Time) quotaApplyResult {
 	acc.mu.Lock()
-	defer func() { acc.mu.Unlock(); p.routingQuotaUpdated(acc, info) }()
+	update := info
+	defer func() { acc.mu.Unlock(); p.routingQuotaUpdated(acc, update, started) }()
 	res := quotaApplyResult{WasPermanent: acc.PermanentlyExhausted}
 	now := time.Now()
-	acc.QuotaInfo = cloneQuotaInfo(info)
-	acc.QuotaCheckedAt = &now
 	if info == nil {
 		return res
 	}
+	info = mergeQuotaUpdate(acc.QuotaInfo, info)
+	acc.QuotaInfo = cloneQuotaInfo(info)
+	if quotaSourceSucceeded(info, "basic") || quotaSourceSucceeded(info, "premium") || quotaSourceSucceeded(info, "allowance") {
+		acc.QuotaCheckedAt = &now
+	}
 	res.BasicLeft = basicRemaining(info)
 	res.HasPremium = info.HasPremium
+	if !quotaSourceSucceeded(info, "basic") {
+		return res
+	}
 	if info.IsEligible {
+		// An exhaustion observed after this fetch started needs a newer confirmation.
+		if !started.IsZero() && acc.QuotaExhaustedAt != nil && acc.QuotaExhaustedAt.After(started) {
+			return res
+		}
 		if acc.PermanentlyExhausted && accountIsLifetimeFree(acc, info) {
 			return res
 		}
@@ -714,6 +743,52 @@ func (p *AccountPool) applyQuotaInfo(acc *Account, info *QuotaInfo) quotaApplyRe
 		res.NowPermanent = true
 	}
 	return res
+}
+
+func quotaSourceSucceeded(info *QuotaInfo, name string) bool {
+	if info == nil {
+		return false
+	}
+	// Existing persisted snapshots and test seams predate per-source status.
+	if info.Sources == nil {
+		return true
+	}
+	s, ok := info.Sources[name]
+	return ok && s.Error == "" && s.SucceededAtMs > 0 && s.CheckedAtMs == s.SucceededAtMs
+}
+
+func mergeQuotaUpdate(previous, update *QuotaInfo) *QuotaInfo {
+	if update.Sources == nil {
+		return cloneQuotaInfo(update)
+	}
+	merged := cloneQuotaInfo(previous)
+	if merged == nil {
+		merged = &QuotaInfo{}
+	}
+	if merged.Sources == nil {
+		merged.Sources = make(map[string]QuotaSourceStatus)
+	}
+	for name, status := range update.Sources {
+		if !quotaSourceSucceeded(update, name) {
+			status.SucceededAtMs = merged.Sources[name].SucceededAtMs
+		}
+		merged.Sources[name] = status
+	}
+	if quotaSourceSucceeded(update, "basic") {
+		merged.IsEligible, merged.SpaceUsage, merged.SpaceLimit = update.IsEligible, update.SpaceUsage, update.SpaceLimit
+		merged.UserUsage, merged.UserLimit = update.UserUsage, update.UserLimit
+		merged.LastUsageAtMs, merged.ResearchModeUsage = update.LastUsageAtMs, update.ResearchModeUsage
+	}
+	if quotaSourceSucceeded(update, "premium") {
+		merged.HasPremium, merged.PremiumBalance, merged.PremiumBalanceKnown = update.HasPremium, update.PremiumBalance, update.PremiumBalanceKnown
+		merged.PremiumUsage, merged.PremiumLimit = update.PremiumUsage, update.PremiumLimit
+	}
+	if quotaSourceSucceeded(update, "allowance") {
+		merged.RateLimit = cloneQuotaInfo(update).RateLimit
+	}
+	merged.RateLimitError = update.RateLimitError
+	merged.QuotaStatusReason = quotaStatusReason(merged)
+	return merged
 }
 
 // Subscription identity is independent of whether this quota snapshot exposes premium credits.
@@ -743,48 +818,58 @@ func accountIsLifetimeFree(acc *Account, info *QuotaInfo) bool {
 //
 // Returns true when the account is currently eligible to serve traffic.
 func (p *AccountPool) RefreshAccountQuota(acc *Account, minInterval time.Duration) bool {
-	if acc == nil {
+	return p.RefreshAccountQuotaContext(context.Background(), acc, minInterval)
+}
+
+// RefreshAccountQuotaContext stops waiting on cancellation without cancelling a shared fetch.
+func (p *AccountPool) RefreshAccountQuotaContext(ctx context.Context, acc *Account, minInterval time.Duration) bool {
+	if acc == nil || ctx.Err() != nil {
 		return false
 	}
-	// Cached fast path: avoid hammering Notion on tight retry loops.
 	quota := acc.quotaSnapshot()
 	if minInterval > 0 && quota.CheckedAt != nil && time.Since(*quota.CheckedAt) < minInterval {
 		return accountHasInferenceQuota(acc)
 	}
-	// Mark this account as having an in-flight live check so async callers
-	// do not pile on. We intentionally still proceed even if another check
-	// is running so the synchronous caller gets a fresh decision.
+	flight := p.startQuotaRefresh(acc)
+	// Only briefly stale, checked-in-process state can skip the preflight wait.
+	if minInterval > 0 && quota.CheckedAt != nil && time.Since(*quota.CheckedAt) <= time.Minute && quota.Info != nil && accountHasInferenceQuota(acc) {
+		return true
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-flight.done:
+		return acc.quotaInfoSnapshot() != nil && accountHasInferenceQuota(acc)
+	}
+}
+
+func (p *AccountPool) startQuotaRefresh(acc *Account) *quotaFlight {
 	p.liveQuotaMu.Lock()
-	p.liveQuotaInflight[acc] = true
-	p.liveQuotaMu.Unlock()
-	defer func() {
+	defer p.liveQuotaMu.Unlock()
+	if flight := p.liveQuotaInflight[acc]; flight != nil {
+		return flight
+	}
+	if p.liveQuotaInflight == nil {
+		p.liveQuotaInflight = make(map[*Account]*quotaFlight)
+	}
+	flight := &quotaFlight{done: make(chan struct{}), started: time.Now()}
+	p.liveQuotaInflight[acc] = flight
+	fetch := quotaFetcher
+	started := flight.started
+	go func() {
+		flight.info, flight.err = fetch(acc)
+		if flight.info != nil {
+			flight.result = p.applyQuotaInfoSince(acc, flight.info, started)
+		}
+		if flight.err != nil {
+			log.Printf("[quota] account %s refresh unavailable (retaining cached values)", acc.AccountID)
+		}
 		p.liveQuotaMu.Lock()
 		delete(p.liveQuotaInflight, acc)
+		close(flight.done)
 		p.liveQuotaMu.Unlock()
 	}()
-
-	info, err := quotaFetcher(acc)
-	if err != nil {
-		log.Printf("[quota-live] %s check failed: %v (using cached state)", acc.UserEmail, err)
-		// On error, trust the cached snapshot — return current eligibility.
-		return accountHasInferenceQuota(acc)
-	}
-
-	res := p.applyQuotaInfo(acc, info)
-	switch {
-	case res.Recovered:
-		log.Printf("[quota-live] %s recovered (basic remaining ~%d, premium=%v)",
-			acc.UserEmail, res.BasicLeft, res.HasPremium)
-	case res.NowPermanent:
-		log.Printf("[quota-live] %s NOT eligible — disabling permanently (free plan)", acc.UserEmail)
-	case res.NowExhausted:
-		log.Printf("[quota-live] %s NOT eligible — disabled (space %d/%d, user %d/%d)",
-			acc.UserEmail, info.SpaceUsage, info.SpaceLimit, info.UserUsage, info.UserLimit)
-	default:
-		log.Printf("[quota-live] %s eligible (basic remaining ~%d, premium=%v)",
-			acc.UserEmail, res.BasicLeft, res.HasPremium)
-	}
-	return accountHasInferenceQuota(acc)
+	return flight
 }
 
 func accountHasInferenceQuota(acc *Account) bool {
@@ -804,36 +889,7 @@ func (p *AccountPool) RefreshAccountQuotaAsync(acc *Account) {
 	if acc == nil {
 		return
 	}
-	p.liveQuotaMu.Lock()
-	if p.liveQuotaInflight[acc] {
-		p.liveQuotaMu.Unlock()
-		return
-	}
-	p.liveQuotaInflight[acc] = true
-	p.liveQuotaMu.Unlock()
-	fetchQuota := quotaFetcher
-
-	go func() {
-		defer func() {
-			p.liveQuotaMu.Lock()
-			delete(p.liveQuotaInflight, acc)
-			p.liveQuotaMu.Unlock()
-		}()
-		info, err := fetchQuota(acc)
-		if err != nil {
-			log.Printf("[quota-live-async] %s check failed: %v", acc.UserEmail, err)
-			return
-		}
-		res := p.applyQuotaInfo(acc, info)
-		switch {
-		case res.NowPermanent:
-			log.Printf("[quota-live-async] %s NOT eligible — disabled permanently (free plan)", acc.UserEmail)
-		case res.NowExhausted:
-			log.Printf("[quota-live-async] %s NOT eligible — disabled (basic %d left)", acc.UserEmail, res.BasicLeft)
-		case res.Recovered:
-			log.Printf("[quota-live-async] %s recovered (basic %d left)", acc.UserEmail, res.BasicLeft)
-		}
-	}()
+	p.startQuotaRefresh(acc)
 }
 
 // isQuotaExhaustedRLock is a read-locked variant of isQuotaExhausted for
@@ -940,15 +996,7 @@ func (p *AccountPool) RemoveAccountByEmail(email string) bool {
 // route traffic to (i.e. quota is healthy AND the workspace probe didn't
 // flag the account as having zero accessible workspaces).
 func (p *AccountPool) AvailableCount() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	count := 0
-	for _, acc := range p.accounts {
-		if !p.isUnusable(acc) {
-			count++
-		}
-	}
-	return count
+	return p.RoutingSnapshot().Available
 }
 
 func (p *AccountPool) Count() int {
@@ -1027,19 +1075,32 @@ func (p *AccountPool) HasNoWorkspace(acc *Account) bool {
 }
 
 func (p *AccountPool) AllModels() []ModelEntry {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	accounts := p.AccountsSnapshot()
+	p.routingMu.Lock()
+	defer p.routingMu.Unlock()
 	seen := map[string]bool{}
-	var models []ModelEntry
-	for _, acc := range p.accounts {
-		for _, m := range acc.modelsSnapshot() {
+	models := []ModelEntry{}
+	hasUnknownModels := false
+	for _, acc := range accounts {
+		status := p.routingAccountStatusLocked(acc, p.routingConfigLocked(), time.Now())
+		if status.Status != "available" && status.Status != "busy" {
+			continue
+		}
+		accountModels := acc.modelsSnapshot()
+		if len(accountModels) == 0 {
+			hasUnknownModels = true
+		}
+		for _, m := range accountModels {
+			if !routingSupportsModel(acc, m.ID, false, p.routingStateLocked(acc)) {
+				continue
+			}
 			if !seen[m.ID] {
 				seen[m.ID] = true
 				models = append(models, m)
 			}
 		}
 	}
-	if len(models) == 0 {
+	if len(models) == 0 && (len(accounts) == 0 || hasUnknownModels) {
 		// Return default models if none loaded
 		for name, id := range SnapshotModelMap() {
 			models = append(models, ModelEntry{Name: name, ID: id})
@@ -1145,15 +1206,23 @@ func (p *AccountPool) RefreshAll(accountsDir string) {
 			defer wg.Done()
 			defer func() { <-sem }() // release semaphore slot
 
-			// 1. Check quota — applyQuotaInfo handles state transitions and
-			// ensures every write happens under p.mu so concurrent selectors
-			// always observe a consistent view.
-			info, err := quotaFetcher(acc)
+			// Join the same per-account refresh used by inference and recovery checks.
+			flight := p.startQuotaRefresh(acc)
+			<-flight.done
+			info, err := acc.quotaInfoSnapshot(), flight.err
+			if err == nil && info != nil {
+				for source, status := range info.Sources {
+					if status.Error != "" {
+						err = fmt.Errorf("%s quota unavailable (retaining last known values)", source)
+						break
+					}
+				}
+			}
 			if err != nil {
 				log.Printf("[refresh] %s (%s): quota check failed: %v", acc.UserName, acc.UserEmail, err)
 				failedChecks.Add(1)
 			} else {
-				res := p.applyQuotaInfo(acc, info)
+				res := flight.result
 				premiumInfo := ""
 				if info.HasPremium {
 					premiumInfo = fmt.Sprintf(", premium %d/%d", info.PremiumUsage, info.PremiumLimit)
@@ -1357,6 +1426,7 @@ func saveAccountFile(dir string, acc *Account) error {
 	}
 	if quota.Info != nil {
 		existing["quota_info"] = map[string]interface{}{
+			"sources":               quota.Info.Sources,
 			"rate_limit":            quota.Info.RateLimit,
 			"rate_limit_error":      quota.Info.RateLimitError,
 			"is_eligible":           quota.Info.IsEligible,
@@ -1435,11 +1505,11 @@ func (p *AccountPool) RefreshAndPersistAccount(ctx context.Context, accountsDir,
 		return fmt.Errorf("account not in pool: %s", email)
 	}
 
-	info, err := quotaFetcher(acc)
-	if err != nil {
-		return fmt.Errorf("quota check: %w", err)
+	flight := p.startQuotaRefresh(acc)
+	<-flight.done
+	if flight.err != nil {
+		return fmt.Errorf("quota check: %w", flight.err)
 	}
-	p.applyQuotaInfo(acc, info)
 
 	models, mErr := modelsFetcher(acc)
 	if mErr != nil {
@@ -1470,6 +1540,7 @@ func (p *AccountPool) RefreshAndPersistAccount(ctx context.Context, accountsDir,
 	p.mu.RLock()
 	spaceCount := acc.SpaceCount
 	p.mu.RUnlock()
+	info := acc.quotaInfoSnapshot()
 	log.Printf("[post-register] %s: quota refreshed and persisted (eligible=%v, space %d/%d, workspaces=%d)",
 		acc.UserEmail, info.IsEligible, info.SpaceUsage, info.SpaceLimit, spaceCount)
 	return nil
@@ -1520,6 +1591,7 @@ func (p *AccountPool) GetAccountDetails() []map[string]interface{} {
 			entry["registered_via"] = acc.RegisteredVia
 		}
 		if quota.Info != nil {
+			entry["quota_sources"] = quota.Info.Sources
 			entry["eligible"] = quota.Info.IsEligible
 			entry["rate_limit"] = quota.Info.RateLimit
 			entry["rate_limit_error"] = quota.Info.RateLimitError
@@ -1583,6 +1655,7 @@ func (p *AccountPool) GetQuotaSummary() []map[string]interface{} {
 			entry["workspace_checked_at"] = acc.WorkspaceCheckedAt.Format(time.RFC3339)
 		}
 		if quota.Info != nil {
+			entry["quota_sources"] = quota.Info.Sources
 			entry["eligible"] = quota.Info.IsEligible
 			entry["usage"] = quota.Info.SpaceUsage
 			entry["limit"] = quota.Info.SpaceLimit
@@ -1644,27 +1717,29 @@ func loadPersistedWorkspace(data []byte, acc *Account) {
 func loadPersistedQuotaInfo(data []byte) *QuotaInfo {
 	var raw struct {
 		QuotaInfo *struct {
-			RateLimit           *CreditRateLimit `json:"rate_limit"`
-			RateLimitError      string           `json:"rate_limit_error"`
-			IsEligible          bool             `json:"is_eligible"`
-			SpaceUsage          int              `json:"space_usage"`
-			SpaceLimit          int              `json:"space_limit"`
-			UserUsage           int              `json:"user_usage"`
-			UserLimit           int              `json:"user_limit"`
-			LastUsageAt         int64            `json:"last_usage_at"`
-			ResearchModeUsage   int              `json:"research_mode_usage"`
-			HasPremium          bool             `json:"has_premium"`
-			PremiumBalance      *int             `json:"premium_balance"`
-			PremiumBalanceKnown bool             `json:"premium_balance_known"`
-			QuotaStatusReason   string           `json:"quota_status_reason"`
-			PremiumUsage        int              `json:"premium_usage"`
-			PremiumLimit        int              `json:"premium_limit"`
+			Sources             map[string]QuotaSourceStatus `json:"sources"`
+			RateLimit           *CreditRateLimit             `json:"rate_limit"`
+			RateLimitError      string                       `json:"rate_limit_error"`
+			IsEligible          bool                         `json:"is_eligible"`
+			SpaceUsage          int                          `json:"space_usage"`
+			SpaceLimit          int                          `json:"space_limit"`
+			UserUsage           int                          `json:"user_usage"`
+			UserLimit           int                          `json:"user_limit"`
+			LastUsageAt         int64                        `json:"last_usage_at"`
+			ResearchModeUsage   int                          `json:"research_mode_usage"`
+			HasPremium          bool                         `json:"has_premium"`
+			PremiumBalance      *int                         `json:"premium_balance"`
+			PremiumBalanceKnown bool                         `json:"premium_balance_known"`
+			QuotaStatusReason   string                       `json:"quota_status_reason"`
+			PremiumUsage        int                          `json:"premium_usage"`
+			PremiumLimit        int                          `json:"premium_limit"`
 		} `json:"quota_info"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil || raw.QuotaInfo == nil {
 		return nil
 	}
 	info := &QuotaInfo{
+		Sources:             raw.QuotaInfo.Sources,
 		RateLimit:           raw.QuotaInfo.RateLimit,
 		RateLimitError:      raw.QuotaInfo.RateLimitError,
 		IsEligible:          raw.QuotaInfo.IsEligible,

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -33,6 +34,32 @@ type RequestAttemptResult struct {
 	ResponseCommitted bool
 	ContentEmitted    bool
 	ToolCallEmitted   bool
+}
+
+func RequestIDFromContext(ctx context.Context) string {
+	trace := TraceRequest(ctx)
+	if trace == nil {
+		return ""
+	}
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	return trace.record.RequestID
+}
+
+// Stage times accumulate across retries and may overlap; they are not a breakdown of total time.
+func (t *RequestTrace) RecordStage(stage string, duration time.Duration) {
+	if t == nil || !validRequestStage(stage) || duration < 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.finalized {
+		return
+	}
+	if t.record.StageDurationsMs == nil {
+		t.record.StageDurationsMs = make(map[string]int64)
+	}
+	t.record.StageDurationsMs[stage] += duration.Milliseconds()
 }
 
 func TraceRequest(ctx context.Context) *RequestTrace {
@@ -279,6 +306,8 @@ func RequestLogMiddleware(store *RequestLogStore, next http.Handler) http.Handle
 		now := time.Now()
 		trace := &RequestTrace{start: now, record: RequestLog{SchemaVersion: 1, RequestID: "req_" + generateUUIDv4(), StartedAtMs: now.UnixMilli(), Protocol: protocol, Status: "in_progress"}}
 		trace.record.RequestUsageTotals.normalize()
+		w.Header().Set("X-Request-ID", trace.record.RequestID)
+		log.Printf("[request] %s protocol=%s status=in_progress", trace.record.RequestID, protocol)
 		_ = store.BeginRequest(trace.record)
 		writer := &requestLogResponseWriter{ResponseWriter: w}
 		var responseWriter http.ResponseWriter = writer
@@ -299,6 +328,7 @@ func RequestLogMiddleware(store *RequestLogStore, next http.Handler) http.Handle
 			}
 			record, attempts := trace.snapshot(writer.status, writer.writeFailed, writer.bytes > 0, r.Context().Err() != nil)
 			_ = store.FinalizeRequest(record, attempts)
+			log.Printf("[request] %s protocol=%s status=%s http_status=%d attempts=%d error_code=%s", record.RequestID, record.Protocol, record.Status, record.HTTPStatus, record.AttemptCount, record.ErrorCode)
 		}()
 		next.ServeHTTP(responseWriter, r)
 	})

@@ -222,9 +222,16 @@ func TestRoutingQuotaResetRequiresSuccessfulRecheck(t *testing.T) {
 	if acc != accounts[1] {
 		t.Fatal("failed reset check recovered exhausted member")
 	}
+	waitQuotaRechecks(t, pool)
 	// A new explicit cooldown deadline permits another confirmation without waiting in the test.
 	pool.SetRoutingFailure(accounts[0].AccountID, "", "rate_limited", time.Now().Add(-time.Second))
 	quotaFetcher = func(acc *Account) (*QuotaInfo, error) { return &QuotaInfo{IsEligible: true, SpaceLimit: 100}, nil }
+	acc, done, err = pool.SelectForRequest("", false, nil, accounts[0].AccountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done()
+	waitQuotaRechecks(t, pool)
 	acc, done, err = pool.SelectForRequest("", false, nil, accounts[0].AccountID)
 	if err != nil {
 		t.Fatal(err)

@@ -45,23 +45,24 @@ type RequestUsageTotals struct {
 }
 
 type RequestLog struct {
-	SchemaVersion     int     `json:"schema_version"`
-	RequestID         string  `json:"request_id"`
-	StartedAtMs       int64   `json:"started_at_ms"`
-	FinishedAtMs      *int64  `json:"finished_at_ms"`
-	Protocol          string  `json:"protocol"`
-	RequestedModel    string  `json:"requested_model"`
-	ResolvedModel     string  `json:"resolved_model"`
-	Stream            bool    `json:"stream"`
-	Status            string  `json:"status"`
-	HTTPStatus        int     `json:"http_status"`
-	DurationMs        *int64  `json:"duration_ms"`
-	FirstTokenMs      *int64  `json:"first_token_ms"`
-	FinalAccountID    *string `json:"final_account_id"`
-	AttemptCount      int     `json:"attempt_count"`
-	ErrorCode         string  `json:"error_code"`
-	PartialResponse   bool    `json:"partial_response"`
-	CompletionEmitted bool    `json:"completion_emitted"`
+	SchemaVersion     int              `json:"schema_version"`
+	RequestID         string           `json:"request_id"`
+	StartedAtMs       int64            `json:"started_at_ms"`
+	FinishedAtMs      *int64           `json:"finished_at_ms"`
+	Protocol          string           `json:"protocol"`
+	RequestedModel    string           `json:"requested_model"`
+	ResolvedModel     string           `json:"resolved_model"`
+	Stream            bool             `json:"stream"`
+	Status            string           `json:"status"`
+	HTTPStatus        int              `json:"http_status"`
+	DurationMs        *int64           `json:"duration_ms"`
+	FirstTokenMs      *int64           `json:"first_token_ms"`
+	StageDurationsMs  map[string]int64 `json:"stage_durations_ms,omitempty"`
+	FinalAccountID    *string          `json:"final_account_id"`
+	AttemptCount      int              `json:"attempt_count"`
+	ErrorCode         string           `json:"error_code"`
+	PartialResponse   bool             `json:"partial_response"`
+	CompletionEmitted bool             `json:"completion_emitted"`
 	RequestUsageTotals
 }
 
@@ -517,6 +518,15 @@ func sanitizeRequestLog(record RequestLog) RequestLog {
 		record.Status = "failed"
 	}
 	record.ErrorCode = safeRequestCode(record.ErrorCode)
+	if record.StageDurationsMs != nil {
+		stages := make(map[string]int64)
+		for stage, duration := range record.StageDurationsMs {
+			if validRequestStage(stage) && duration >= 0 {
+				stages[stage] = duration
+			}
+		}
+		record.StageDurationsMs = stages
+	}
 	if record.FinalAccountID != nil {
 		value := safeAccountID(*record.FinalAccountID)
 		if value == "" {
@@ -526,6 +536,14 @@ func sanitizeRequestLog(record RequestLog) RequestLog {
 		}
 	}
 	return record
+}
+
+func validRequestStage(stage string) bool {
+	switch stage {
+	case "account_selection", "quota_check", "upstream", "tool_parse":
+		return true
+	}
+	return false
 }
 
 func safeRequestMetadata(value string) string {

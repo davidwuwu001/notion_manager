@@ -50,14 +50,15 @@ type Account struct {
 
 // QuotaInfo holds AI usage quota information from V1 + V2 APIs
 type QuotaInfo struct {
-	RateLimit      *CreditRateLimit `json:"rate_limit,omitempty"`
-	RateLimitError string           `json:"rate_limit_error,omitempty"`
-	IsEligible     bool             `json:"isEligible"`
-	SpaceUsage     int              `json:"spaceUsage"`
-	SpaceLimit     int              `json:"spaceLimit"`
-	UserUsage      int              `json:"userUsage"`
-	UserLimit      int              `json:"userLimit"`
-	LastUsageAtMs  int64            `json:"lastSpaceUsageAtMs"`
+	Sources        map[string]QuotaSourceStatus `json:"sources,omitempty"`
+	RateLimit      *CreditRateLimit             `json:"rate_limit,omitempty"`
+	RateLimitError string                       `json:"rate_limit_error,omitempty"`
+	IsEligible     bool                         `json:"isEligible"`
+	SpaceUsage     int                          `json:"spaceUsage"`
+	SpaceLimit     int                          `json:"spaceLimit"`
+	UserUsage      int                          `json:"userUsage"`
+	UserLimit      int                          `json:"userLimit"`
+	LastUsageAtMs  int64                        `json:"lastSpaceUsageAtMs"`
 	// Research mode (from V1 API: getAIUsageEligibility)
 	ResearchModeUsage int `json:"researchModeUsage"` // usage when "Share data to improve AI" is enabled
 	// Premium credits (from V2 API: getAIUsageEligibilityV2)
@@ -67,6 +68,13 @@ type QuotaInfo struct {
 	QuotaStatusReason   string `json:"quota_status_reason,omitempty"`
 	PremiumUsage        int    `json:"premiumUsage"` // used premium credits (monthlyAllocated)
 	PremiumLimit        int    `json:"premiumLimit"` // total premium credit limit
+}
+
+// QuotaSourceStatus keeps freshness independent from the last usable source values.
+type QuotaSourceStatus struct {
+	CheckedAtMs   int64  `json:"checked_at_ms"`
+	SucceededAtMs int64  `json:"succeeded_at_ms,omitempty"`
+	Error         string `json:"error,omitempty"`
 }
 
 // CreditRateLimit is the allowance shown in Notion's AI Usage settings, separate from premium credits.

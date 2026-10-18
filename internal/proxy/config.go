@@ -117,7 +117,7 @@ func DefaultConfig() *Config {
 			TokenFile:     "token.txt",
 			ApiKey:        "",
 			LogFile:       "",
-			DebugLogging:  true,
+			DebugLogging:  false,
 			APILogInput:   false,
 			APILogOutput:  false,
 			NotionLogReq:  false,

@@ -404,6 +404,9 @@ func (t *openAIChatStreamTranscoder) HandleFrame(frame anthropicSSEFrame) error 
 		delta, _ := payload["delta"].(map[string]interface{})
 		stop := mapAnthropicStopReasonToOpenAI(stringValue(delta["stop_reason"]))
 		if usage, ok := payload["usage"].(map[string]interface{}); ok {
+			if input, known := usage["input_tokens"]; known {
+				t.inputTokens = intValue(input)
+			}
 			t.outputTokens = intValue(usage["output_tokens"])
 		}
 		if err := t.emitChunk(map[string]interface{}{}, &stop, nil); err != nil {
@@ -872,6 +875,9 @@ func (t *openAIResponsesStreamTranscoder) HandleFrame(frame anthropicSSEFrame) e
 		return t.finalizeToolItem(index)
 	case "message_delta":
 		if usage, ok := payload["usage"].(map[string]interface{}); ok {
+			if input, known := usage["input_tokens"]; known {
+				t.inputTokens = intValue(input)
+			}
 			t.outputTokens = intValue(usage["output_tokens"])
 		}
 		if err := t.finalizeMessageItem(); err != nil {
@@ -908,7 +914,8 @@ func HandleOpenAIChatCompletions(pool *AccountPool) http.HandlerFunc {
 			return
 		}
 		log.Printf("[openai-chat] incoming /v1/chat/completions request (%d bytes)", len(bodyBytes))
-		LogAPIInputJSONBytes("openai-chat", "incoming /v1/chat/completions request", bodyBytes)
+		LogAPIInputJSONBytes(RequestIDFromContext(r.Context()), "incoming /v1/chat/completions request", bodyBytes)
+		setBridgeCompatibilityHeaders(w, bodyBytes)
 
 		var req OpenAIChatCompletionRequest
 		if err := json.Unmarshal(bodyBytes, &req); err != nil {
@@ -936,7 +943,7 @@ func HandleOpenAIChatCompletions(pool *AccountPool) http.HandlerFunc {
 		}
 
 		resp := buildOpenAIChatCompletionResponse(respID, created, anthReq.Model, anthResp)
-		LogAPIOutputJSON(respID, "openai chat completions response", resp)
+		LogAPIOutputJSON(RequestIDFromContext(r.Context()), "openai chat completions response", resp)
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
 			TraceRequest(r.Context()).FinishFailure("failed", "write_failed")
@@ -964,7 +971,8 @@ func HandleOpenAIResponses(pool *AccountPool) http.HandlerFunc {
 			return
 		}
 		log.Printf("[openai-resp] incoming /v1/responses request (%d bytes)", len(bodyBytes))
-		LogAPIInputJSONBytes("openai-resp", "incoming /v1/responses request", bodyBytes)
+		LogAPIInputJSONBytes(RequestIDFromContext(r.Context()), "incoming /v1/responses request", bodyBytes)
+		setBridgeCompatibilityHeaders(w, bodyBytes)
 
 		var req OpenAIResponsesRequest
 		if err := json.Unmarshal(bodyBytes, &req); err != nil {
@@ -992,7 +1000,7 @@ func HandleOpenAIResponses(pool *AccountPool) http.HandlerFunc {
 		}
 
 		resp := buildOpenAIResponsesResponse(respID, created, anthReq.Model, anthResp, toolAliases)
-		LogAPIOutputJSON(respID, "openai responses response", resp)
+		LogAPIOutputJSON(RequestIDFromContext(r.Context()), "openai responses response", resp)
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
 			TraceRequest(r.Context()).FinishFailure("failed", "write_failed")

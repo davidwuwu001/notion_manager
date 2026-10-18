@@ -73,8 +73,8 @@ func TestBuildSessionChainFollowUp_MultipleToolResults(t *testing.T) {
 	}
 }
 
-// TestBuildSessionChainFollowUp_TruncatesLargeOutput verifies truncation of large tool output.
-func TestBuildSessionChainFollowUp_TruncatesLargeOutput(t *testing.T) {
+// Large results must reach the model intact, including their tail.
+func TestBuildSessionChainFollowUp_PreservesLargeOutput(t *testing.T) {
 	largeOutput := strings.Repeat("x", 5000)
 	messages := []ChatMessage{
 		{Role: "user", Content: "read large file"},
@@ -87,12 +87,8 @@ func TestBuildSessionChainFollowUp_TruncatesLargeOutput(t *testing.T) {
 	result := buildSessionChainFollowUp(messages, "- Read(file_path: str)\n", "")
 
 	content := result[0].Content
-	if !strings.Contains(content, "... (truncated)") {
-		t.Errorf("expected truncation marker in large output")
-	}
-	// Should be well under the original 5000 chars
-	if len(content) > 4500 {
-		t.Errorf("follow-up too large: %d chars (expected < 4500)", len(content))
+	if !strings.Contains(content, largeOutput) {
+		t.Error("follow-up lost part of the large tool result")
 	}
 }
 
@@ -172,8 +168,7 @@ func TestCountNonSystemMessages(t *testing.T) {
 	}
 }
 
-// TestSessionFingerprintStability verifies that the session fingerprint is stable
-// across turns when computed on raw (pre-injection) messages.
+// Explicit conversation IDs preserve continuity; missing IDs isolate histories.
 func TestSessionFingerprintStability(t *testing.T) {
 	systemPrompt := "You are Claude Code, a CLI assistant..."
 
@@ -201,15 +196,18 @@ func TestSessionFingerprintStability(t *testing.T) {
 		{Role: "tool", Content: "content of file1"},
 	}
 
-	fp1 := computeSessionFingerprint(turn1)
-	fp2 := computeSessionFingerprint(turn2)
-	fp3 := computeSessionFingerprint(turn3)
+	fp1 := computeSessionFingerprintForRequest(turn1, "session-1", "opus-4.6")
+	fp2 := computeSessionFingerprintForRequest(turn2, "session-1", "opus-4.6")
+	fp3 := computeSessionFingerprintForRequest(turn3, "session-1", "opus-4.6")
 
 	if fp1 != fp2 {
 		t.Errorf("fingerprint changed between turn 1 and 2: %s vs %s", fp1, fp2)
 	}
 	if fp2 != fp3 {
 		t.Errorf("fingerprint changed between turn 2 and 3: %s vs %s", fp2, fp3)
+	}
+	if computeSessionFingerprint(turn1) == computeSessionFingerprint(turn2) || computeSessionFingerprint(turn2) == computeSessionFingerprint(turn3) {
+		t.Fatal("different histories without a conversation ID must not share a thread")
 	}
 }
 

@@ -3,6 +3,7 @@ package proxy
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -228,39 +229,21 @@ func cloneChatMessages(src []ChatMessage) []ChatMessage {
 	return out
 }
 
-// computeSessionFingerprintWithSalt generates a fingerprint from the message history
-// to identify the same conversation across Anthropic API requests.
-// Strategy: hash(optional stable salt + normalized system prompt prefix + first user message prefix).
+// computeSessionFingerprintWithSalt hashes complete structured history and its namespace.
+// Prefixes cannot distinguish two tasks that start with the same instructions.
 func computeSessionFingerprintWithSalt(messages []ChatMessage, stableSalt string) string {
-	h := sha256.New()
-	if stableSalt != "" {
-		h.Write([]byte("salt:"))
-		h.Write([]byte(stableSalt))
-		h.Write([]byte{'\n'})
-	}
-	// Include system prompt
-	for _, m := range messages {
+	normalized := cloneChatMessages(messages)
+	for i, m := range normalized {
 		if m.Role == "system" {
-			content := normalizeSessionSystemContent(m.Content)
-			if len(content) > 200 {
-				content = content[:200]
-			}
-			h.Write([]byte(content))
-			break
+			normalized[i].Content = normalizeSessionSystemContent(m.Content)
 		}
 	}
-	// Include first user message
-	for _, m := range messages {
-		if isMeaningfulUserMessage(m) {
-			content := normalizeSessionUserContent(m.Content)
-			if len(content) > 200 {
-				content = content[:200]
-			}
-			h.Write([]byte(content))
-			break
-		}
-	}
-	return hex.EncodeToString(h.Sum(nil))[:32]
+	data, _ := json.Marshal(struct {
+		Salt     string
+		Messages []ChatMessage
+	}{stableSalt, normalized})
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:])[:32]
 }
 
 func computeSessionFingerprintForRequest(messages []ChatMessage, sessionSalt string, resolvedModel string) string {
@@ -340,11 +323,6 @@ func buildRecoveryMessages(messages []ChatMessage, skipEntry func(ChatMessage, s
 		return messages
 	}
 
-	const (
-		maxHistoryChars = 4000
-		maxEntryChars   = 900
-	)
-
 	lastUserIdx := -1
 	for i := len(messages) - 1; i >= 0; i-- {
 		if isMeaningfulUserMessage(messages[i]) {
@@ -354,13 +332,6 @@ func buildRecoveryMessages(messages []ChatMessage, skipEntry func(ChatMessage, s
 	}
 	if lastUserIdx < 0 {
 		return messages
-	}
-
-	clip := func(s string, limit int) string {
-		if limit <= 0 || len(s) <= limit {
-			return s
-		}
-		return s[:limit] + "..."
 	}
 
 	var systemParts []string
@@ -376,7 +347,6 @@ func buildRecoveryMessages(messages []ChatMessage, skipEntry func(ChatMessage, s
 	}
 
 	var reversed []historyEntry
-	usedChars := 0
 	hasPostUserHistory := false
 	for i := lastUserIdx + 1; i < len(messages); i++ {
 		if (messages[i].Role == "assistant" || messages[i].Role == "tool") && shouldCountNonSystemMessage(messages[i]) {
@@ -437,12 +407,6 @@ func buildRecoveryMessages(messages []ChatMessage, skipEntry func(ChatMessage, s
 			continue
 		}
 
-		content = clip(content, maxEntryChars)
-		entryCost := len(label) + len(content) + 4
-		if usedChars > 0 && usedChars+entryCost > maxHistoryChars {
-			break
-		}
-		usedChars += entryCost
 		reversed = append(reversed, historyEntry{label: label, content: content})
 	}
 

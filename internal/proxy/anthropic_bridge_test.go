@@ -21,10 +21,10 @@ func TestExtractAnthropicSessionSaltFromPlainStrings(t *testing.T) {
 		metadata map[string]interface{}
 		want     string
 	}{
-		{name: "prompt cache key", metadata: map[string]interface{}{"prompt_cache_key": " task-123 "}, want: "task-123"},
+		{name: "prompt cache key", metadata: map[string]interface{}{"prompt_cache_key": " task-123 "}, want: ""},
 		{name: "session id", metadata: map[string]interface{}{"session_id": "session-123"}, want: "session-123"},
 		{name: "conversation id", metadata: map[string]interface{}{"conversation_id": "conversation-123"}, want: "conversation-123"},
-		{name: "user id", metadata: map[string]interface{}{"user_id": "user-123"}, want: "user-123"},
+		{name: "user id", metadata: map[string]interface{}{"user_id": "user-123"}, want: ""},
 	}
 
 	for _, tt := range tests {
@@ -99,8 +99,8 @@ func TestComputeSessionFingerprintWithSalt_IgnoresBillingHeaderDrift(t *testing.
 		{Role: "tool", ToolCallID: "call_1", Name: "Grep", Content: "Found 1 file\nsrc/content.js"},
 	}
 
-	fp1 := computeSessionFingerprintWithSalt(turn1, "sess-123")
-	fp2 := computeSessionFingerprintWithSalt(turn2, "sess-123")
+	fp1 := computeSessionFingerprintForRequest(turn1, "sess-123", "opus-4.6")
+	fp2 := computeSessionFingerprintForRequest(turn2, "sess-123", "opus-4.6")
 	if fp1 != fp2 {
 		t.Fatalf("fingerprint drifted across billing-header changes: %s vs %s", fp1, fp2)
 	}
@@ -169,11 +169,11 @@ func TestInjectToolsIntoMessages_DropsWrapperOnlyUserMessage(t *testing.T) {
 	}
 
 	got := injectToolsIntoMessages(messages, tools, "claude-opus-4-6", nil)
-	if len(got) != 1 {
-		t.Fatalf("expected 1 bridged message, got %d", len(got))
+	if len(got) != 2 || got[0].Role != "system" || got[0].Content != "You are Claude Code." {
+		t.Fatalf("expected the original system instructions and bridged user message, got %#v", got)
 	}
 
-	content := got[0].Content
+	content := got[1].Content
 	if strings.Contains(content, "User: Hello") || strings.Contains(content, "\nHello\n") {
 		t.Fatalf("wrapper-only message should not turn into synthetic Hello: %q", content)
 	}

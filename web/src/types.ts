@@ -52,6 +52,7 @@ export interface AccountInfo {
     billingPeriodWindow: { used: number; limit: number; periodEndMs: number }
   }
   rate_limit_error?: string
+  quota_sources?: Partial<Record<'basic' | 'premium' | 'allowance', { checked_at_ms: number; succeeded_at_ms: number; error?: string }>>
   token_v2?: string
   registered_via?: string
 }
@@ -228,6 +229,7 @@ export interface RequestLog extends RequestUsage {
   http_status: number
   duration_ms: number | null
   first_token_ms: number | null
+  stage_durations_ms?: Partial<Record<'account_selection' | 'quota_check' | 'upstream' | 'tool_parse', number>>
   final_account_id: string | null
   attempt_count: number
   error_code: string

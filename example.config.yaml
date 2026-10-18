@@ -14,18 +14,18 @@ server:
     # or x-api-key: <api_key>
     api_key: ""
     # Log file path (env: LOG_FILE). Empty = stderr.
-    # Logs are appended to this file on startup.
+    # Rotates at 10 MiB; retains at most 3 backups. Does not rotate external stderr capture.
     log_file: "server.stderr.log"
-    # High-volume debug/process logs.
-    debug_logging: true
+    # Metadata-only debug/process logs. Enable raw switches below only when diagnosing.
+    debug_logging: false
     # Log incoming /v1/messages request bodies (env: API_LOG_INPUT).
-    api_log_input: true
+    api_log_input: false
     # Log responses returned to API clients (env: API_LOG_OUTPUT).
-    api_log_output: true
+    api_log_output: false
     # Log runInferenceTranscript request bodies sent to Notion (env: NOTION_LOG_REQUEST).
-    notion_log_request: true
+    notion_log_request: false
     # Log raw runInferenceTranscript responses received from Notion (env: NOTION_LOG_RESPONSE).
-    notion_log_response: true
+    notion_log_response: false
     # Dump incoming API system prompts and tool schemas to files (env: DUMP_API_INPUT).
     # When true, writes claude_code_system_dump.json/txt and claude_code_tools_dump.json
     # to the working directory on each request. Useful for debugging Claude Code integration.

@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next'
 import type { LogCoverage, RequestAnalytics } from '../types'
 import { emptyLogFilters, filterParams, metricValue, timestampValue } from '../dashboard'
 import type { LogFilters } from '../dashboard'
+import { startVisiblePolling } from '../polling'
 
 export const buttonClass = 'rounded-md border border-border bg-bg-card px-3 py-2 text-[12px] text-text-primary hover:bg-bg-card-hover cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed'
 export const inputClass = 'min-w-0 rounded-md border border-border bg-bg-input px-3 py-2 text-[12px] text-text-primary'
@@ -14,26 +15,19 @@ export function useAdminResource<T>(load: (signal: AbortSignal) => Promise<T>, d
   const [loading, setLoading] = useState(true)
   const [version, setVersion] = useState(0)
   useEffect(() => {
-    const controller = new AbortController()
-    let timer: ReturnType<typeof setTimeout> | undefined
     setData(null)
     setLoading(true)
     setError('')
-    const refresh = async () => {
+    return startVisiblePolling(async signal => {
       try {
-        const result = await load(controller.signal)
-        if (!controller.signal.aborted) { setData(result); setError('') }
+        const result = await load(signal)
+        if (!signal.aborted) { setData(result); setError('') }
       } catch (reason) {
-        if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : String(reason))
+        if (!signal.aborted) setError(reason instanceof Error ? reason.message : String(reason))
       } finally {
-        if (!controller.signal.aborted) {
-          setLoading(false)
-          if (pollMs) timer = setTimeout(refresh, pollMs)
-        }
+        if (!signal.aborted) setLoading(false)
       }
-    }
-    void refresh()
-    return () => { controller.abort(); clearTimeout(timer) }
+    }, pollMs)
   }, [...dependencies, version])
   return { data, error, loading, reload: () => setVersion(value => value + 1) }
 }

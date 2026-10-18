@@ -52,7 +52,7 @@ func UploadFileToNotionThread(acc *Account, file *FileAttachment, threadID strin
 	uuidFileName := generateUUIDv4() + ext
 
 	// Step 1: Get presigned upload URL
-	log.Printf("[upload-debug] Step 1: getUploadUrl for %s (%s, %d bytes)", file.FileName, file.ContentType, len(file.Data))
+	log.Printf("[upload-debug] Step 1: getUploadUrl (%d bytes)", len(file.Data))
 	uploadReq := NotionUploadURLRequest{
 		Name:         uuidFileName,
 		ContentType:  file.ContentType,
@@ -69,10 +69,10 @@ func UploadFileToNotionThread(acc *Account, file *FileAttachment, threadID strin
 	if err != nil {
 		return nil, fmt.Errorf("step 1 getUploadUrl: %w", err)
 	}
-	log.Printf("[upload-debug] Step 1 OK: attachment URL = %s", uploadResp.URL)
+	log.Printf("[upload-debug] Step 1 OK: attachment URL present=%v", uploadResp.URL != "")
 
 	// Step 2: Upload file to S3
-	log.Printf("[upload-debug] Step 2: S3 upload to %s", uploadResp.SignedUploadPostURL)
+	log.Printf("[upload-debug] Step 2: S3 upload")
 	err = uploadToS3(client, uploadResp.SignedUploadPostURL, uploadResp.Fields, file.Data, file.ContentType)
 	if err != nil {
 		return nil, fmt.Errorf("step 2 S3 upload: %w", err)

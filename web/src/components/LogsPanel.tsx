@@ -11,14 +11,14 @@ export function LogsPanel() {
   const [cursors, setCursors] = useState<string[]>([''])
   const [selected, setSelected] = useState('')
   const cursor = cursors[cursors.length - 1]
-  const logs = useAdminResource(signal => fetchRequestLogs(filters, cursor, 50, signal), [filters, cursor])
+  const logs = useAdminResource(signal => fetchRequestLogs(filters, cursor, 50, signal), [filters, cursor], 5000)
   return <div>
     <h1 className="text-xl font-semibold mb-5">{t('upgrade.logs')}</h1>
     <RequestFilters onApply={value => { setFilters(value); setCursors(['']); setSelected('') }} />
     <ResourceState {...logs} retry={logs.reload} />
     {logs.data && <>
       <Coverage data={logs.data} />
-      <div className="flex justify-between items-center mb-3 gap-3 text-sm"><span>{t('upgrade.total_rows', { count: logs.data.total })}</span><button className={buttonClass} onClick={logs.reload}>{t('upgrade.refresh')}</button></div>
+      <div className="flex justify-between items-center mb-3 gap-3 text-sm"><span>{t('upgrade.total_rows', { count: logs.data.total })}<span className="ml-3 text-[11px] text-text-secondary">{t('upgrade.auto_refresh', { seconds: 5 })}</span></span><button className={buttonClass} onClick={logs.reload}>{t('upgrade.refresh')}</button></div>
       <div className="overflow-x-auto border border-border rounded-lg">
         <table className="dashboard-table"><thead><tr>{['time', 'model', 'filter_protocol', 'status', 'tokens', 'duration', 'attempts'].map(key => <th key={key}>{t(`upgrade.${key}`)}</th>)}</tr></thead><tbody>
           {logs.data.items.map(log => <tr key={log.request_id}>
@@ -42,7 +42,7 @@ export function LogsPanel() {
 
 function LogDetail({ id, onClose }: { id: string; onClose: () => void }) {
   const { t } = useTranslation()
-  const detail = useAdminResource<RequestLogDetail>(signal => fetchRequestLog(id, signal), [id])
+  const detail = useAdminResource<RequestLogDetail>(signal => fetchRequestLog(id, signal), [id], 5000)
   const dialog = useRef<HTMLDialogElement>(null)
   useEffect(() => {
     const element = dialog.current
@@ -56,6 +56,7 @@ function LogDetail({ id, onClose }: { id: string; onClose: () => void }) {
     ['filter_protocol', request.protocol], ['status', t(`upgrade.status_${request.status}`)],
     ['http_status', request.http_status || '—'], ['duration', metricValue(request.duration_ms, ' ms')],
     ['first_token', metricValue(request.first_token_ms, ' ms')], ['filter_account_id', request.final_account_id || '—'],
+    ...(['account_selection', 'quota_check', 'upstream', 'tool_parse'] as const).map(stage => [`stage_${stage}`, metricValue(request.stage_durations_ms?.[stage], ' ms')]),
     ['stream', request.stream ? 'SSE' : 'JSON'], ['error_code', request.error_code || '—'],
     ['input_tokens', metricValue(request.input_tokens)], ['output_tokens', metricValue(request.output_tokens)],
     ['usage_source', t(`upgrade.usage_${request.usage_source}`)], ['usage_completeness', request.usage_completeness],
@@ -68,6 +69,7 @@ function LogDetail({ id, onClose }: { id: string; onClose: () => void }) {
     <div className="flex items-center justify-between gap-3 mb-4"><h2 id="request-detail-title" className="font-semibold">{t('upgrade.request_detail')}</h2><button className={buttonClass} onClick={onClose}>{t('common.close')}</button></div>
     <ResourceState {...detail} retry={detail.reload} />
     {detail.data && <><Coverage data={detail.data} /><dl className="grid sm:grid-cols-2 gap-x-6 gap-y-3 mb-5 text-[12px]">{rows.map(([key, value]) => <div key={key} className="min-w-0"><dt className="text-text-secondary">{t(`upgrade.${key}`)}</dt><dd className="break-all font-mono mt-1">{value}</dd></div>)}</dl>
+      <p className="text-[11px] text-text-secondary mb-4">{t('upgrade.stage_note')}</p>
       <Panel title={t('upgrade.attempts')}>
         {!detail.data.attempts.length && <p className="text-sm text-text-secondary">{t('upgrade.empty')}</p>}
         <ol className="space-y-3">{detail.data.attempts.map(attempt => <li key={attempt.attempt_no} className="border border-border rounded-md p-3 text-[12px] space-y-1 break-words">

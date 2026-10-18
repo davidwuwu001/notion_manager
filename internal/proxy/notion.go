@@ -195,6 +195,7 @@ func executeWebSearch(acc *Account, query string, model string, requestID string
 	callOpts.KnownCitationDocs = &knownCitationDocs
 	callOpts.KnownToolCallURLs = &knownToolCallURLs
 
+	upstreamStarted := time.Now()
 	err := inferenceCaller(acc, messages, model, false, func(delta string, done bool, usage *UsageInfo) {
 		if delta != "" {
 			result.WriteString(delta)
@@ -203,6 +204,7 @@ func executeWebSearch(acc *Account, query string, model string, requestID string
 			finalUsage = usage
 		}
 	}, callOpts)
+	TraceRequest(callOpts.Context).RecordStage("upstream", time.Since(upstreamStarted))
 
 	text := result.String()
 	if err == nil && text != "" {
@@ -1900,60 +1902,87 @@ func setNotionHeadersJSON(req *http.Request, acc *Account) {
 //   - V1 (getAIUsageEligibility): isEligible, basic credits, researchModeUsage
 //   - V2 (getAIUsageEligibilityV2): premium credits (monthlyAllocated, etc.)
 func CheckQuota(acc *Account) (*QuotaInfo, error) {
-	body, _ := json.Marshal(map[string]string{"spaceId": acc.SpaceID})
-	client := getChromeHTTPClient(AppConfig.APITimeoutDuration())
+	return checkQuotaWithClient(acc, getChromeHTTPClient(AppConfig.APITimeoutDuration()))
+}
 
-	// --- V1: get isEligible + researchModeUsage ---
-	reqV1, err := http.NewRequest("POST", NotionAPIBase+"/getAIUsageEligibility", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("create V1 request: %w", err)
-	}
-	setNotionHeadersJSON(reqV1, acc)
-
-	respV1, err := client.Do(reqV1)
-	if err != nil {
-		return nil, fmt.Errorf("V1 request: %w", err)
-	}
-	defer respV1.Body.Close()
-	bodyV1, _ := io.ReadAll(respV1.Body)
-	if respV1.StatusCode != 200 {
-		return nil, fmt.Errorf("V1 API error %d: %s", respV1.StatusCode, string(bodyV1[:min(len(bodyV1), 300)]))
-	}
+func checkQuotaWithClient(acc *Account, client *http.Client) (*QuotaInfo, error) {
 	var v1 quotaV1Response
-	if err := json.Unmarshal(bodyV1, &v1); err != nil {
-		return nil, fmt.Errorf("parse V1 response: %w", err)
-	}
-
-	// --- V2: get premium credits ---
-	body2, _ := json.Marshal(map[string]string{"spaceId": acc.SpaceID})
-	reqV2, err := http.NewRequest("POST", NotionAPIBase+"/getAIUsageEligibilityV2", bytes.NewReader(body2))
-	if err != nil {
-		return nil, fmt.Errorf("create V2 request: %w", err)
-	}
-	setNotionHeadersJSON(reqV2, acc)
-
-	respV2, err := client.Do(reqV2)
-	if err != nil {
-		return nil, fmt.Errorf("V2 request: %w", err)
-	}
-	defer respV2.Body.Close()
-	bodyV2, _ := io.ReadAll(respV2.Body)
-	if respV2.StatusCode != 200 {
-		return nil, fmt.Errorf("V2 API error %d: %s", respV2.StatusCode, string(bodyV2[:min(len(bodyV2), 300)]))
-	}
 	var v2 quotaV2Response
-	if err := json.Unmarshal(bodyV2, &v2); err != nil {
-		return nil, fmt.Errorf("parse V2 response: %w", err)
-	}
-
+	var allowance *CreditRateLimit
+	var sourceErrors [3]error
+	var checked [3]int64
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		sourceErrors[0] = fetchQuotaJSON(acc, client, "/getAIUsageEligibility", "isEligible", &v1)
+		checked[0] = time.Now().UnixMilli()
+	}()
+	go func() {
+		defer wg.Done()
+		sourceErrors[1] = fetchQuotaJSON(acc, client, "/getAIUsageEligibilityV2", "premiumCredits", &v2)
+		if sourceErrors[1] == nil && v2.PremiumCredits.TotalCreditBalance == nil {
+			sourceErrors[1] = errors.New("premium balance unavailable")
+		}
+		checked[1] = time.Now().UnixMilli()
+	}()
+	go func() {
+		defer wg.Done()
+		allowance, sourceErrors[2] = checkCreditRateLimit(acc, client)
+		checked[2] = time.Now().UnixMilli()
+	}()
+	wg.Wait()
 	info := mergeQuotaResponses(v1, v2)
-	info.RateLimit, err = checkCreditRateLimit(acc, client)
-	if err != nil {
+	info.RateLimit = allowance
+	info.Sources = make(map[string]QuotaSourceStatus)
+	successes := 0
+	for i, name := range []string{"basic", "premium", "allowance"} {
+		status := QuotaSourceStatus{CheckedAtMs: checked[i]}
+		if sourceErrors[i] != nil {
+			status.Error = name + " quota unavailable"
+		} else {
+			status.SucceededAtMs = checked[i]
+			successes++
+		}
+		info.Sources[name] = status
+	}
+	if sourceErrors[2] != nil {
 		info.RateLimitError = "AI usage unavailable"
-		log.Printf("[quota] credit rate limit unavailable: %v", err)
 	}
 	info.QuotaStatusReason = quotaStatusReason(info)
+	if successes == 0 {
+		return info, errors.New("all quota sources unavailable")
+	}
 	return info, nil
+}
+
+func fetchQuotaJSON(acc *Account, client *http.Client, endpoint, required string, value interface{}) error {
+	body, _ := json.Marshal(map[string]string{"spaceId": acc.SpaceID})
+	req, err := http.NewRequest(http.MethodPost, NotionAPIBase+endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	setNotionHeadersJSON(req, acc)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("quota HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if field := fields[required]; len(field) == 0 || string(field) == "null" {
+		return errors.New("quota field unavailable")
+	}
+	return json.Unmarshal(data, value)
 }
 
 func mergeQuotaResponses(v1 quotaV1Response, v2 quotaV2Response) *QuotaInfo {
@@ -1967,10 +1996,12 @@ func mergeQuotaResponses(v1 quotaV1Response, v2 quotaV2Response) *QuotaInfo {
 		ResearchModeUsage: v1.ResearchModeUsage,
 		// Premium credits from V2
 		PremiumBalanceKnown: v2.PremiumCredits.TotalCreditBalance != nil,
-		PremiumUsage:   v2.PremiumCredits.PerSource.MonthlyAllocated.UsageTotal,
-		PremiumLimit:   v2.PremiumCredits.PerSource.MonthlyAllocated.Limit,
+		PremiumUsage:        v2.PremiumCredits.PerSource.MonthlyAllocated.UsageTotal,
+		PremiumLimit:        v2.PremiumCredits.PerSource.MonthlyAllocated.Limit,
 	}
-	if v2.PremiumCredits.TotalCreditBalance != nil { info.PremiumBalance = *v2.PremiumCredits.TotalCreditBalance }
+	if v2.PremiumCredits.TotalCreditBalance != nil {
+		info.PremiumBalance = *v2.PremiumCredits.TotalCreditBalance
+	}
 	info.HasPremium = info.PremiumLimit > 0 ||
 		v2.PremiumCredits.PerSource.MonthlyCommitted.Limit > 0 ||
 		v2.PremiumCredits.PerSource.YearlyElastic.Limit > 0 ||
@@ -1982,10 +2013,16 @@ func mergeQuotaResponses(v1 quotaV1Response, v2 quotaV2Response) *QuotaInfo {
 func quotaStatusReason(info *QuotaInfo) string {
 	if !info.IsEligible && info.RateLimit != nil {
 		blocked, _ := routingAllowanceBlocked(info)
-		if !blocked && (info.RateLimit.Window.Limit > 0 || info.RateLimit.BillingPeriodWindow.Limit > 0) { return "eligibility_conflict" }
+		if !blocked && (info.RateLimit.Window.Limit > 0 || info.RateLimit.BillingPeriodWindow.Limit > 0) {
+			return "eligibility_conflict"
+		}
 	}
-	if !info.PremiumBalanceKnown { return "premium_balance_unknown" }
-	if info.PremiumBalance == 0 && info.PremiumLimit > info.PremiumUsage { return "premium_balance_conflict" }
+	if !info.PremiumBalanceKnown {
+		return "premium_balance_unknown"
+	}
+	if info.PremiumBalance == 0 && info.PremiumLimit > info.PremiumUsage {
+		return "premium_balance_conflict"
+	}
 	return ""
 }
 

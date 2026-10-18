@@ -5,11 +5,11 @@ import { buttonClass, Coverage, Metric, Panel, RequestMetrics, RequestTimeline, 
 
 export function OverviewPanel() {
   const { t } = useTranslation()
-  const pool = useAdminResource(signal => fetchDashboardData({ page: 0, pageSize: 1 }, signal), [])
-  const routing = useAdminResource(fetchRouting, [])
+  const pool = useAdminResource(signal => fetchDashboardData({ page: 0, pageSize: 1 }, signal), [], 10000)
+  const routing = useAdminResource(fetchRouting, [], 10000)
   const analytics = useAdminResource(signal => fetchAnalytics(emptyLogFilters, signal), [], 15000)
   const logs = useAdminResource(signal => fetchRequestLogs(emptyLogFilters, '', 8, signal), [], 15000)
-  const history = useAdminResource(fetchTokenStats, [])
+  const history = useAdminResource(fetchTokenStats, [], 15000)
   const availability = routingMetrics(routing.data)
   return <div className="space-y-5">
     <h1 className="text-xl font-semibold">{t('upgrade.overview')}</h1>

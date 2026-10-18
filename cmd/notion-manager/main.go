@@ -200,6 +200,7 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 
 	// Anthropic + OpenAI-compatible API endpoints
 	mux.HandleFunc("/v1/messages", proxy.HandleAnthropicMessages(pool))
+	mux.HandleFunc("/v1/capabilities", proxy.HandleCapabilities)
 	mux.HandleFunc("/v1/chat/completions", proxy.HandleOpenAIChatCompletions(pool))
 	mux.HandleFunc("/v1/responses", proxy.HandleOpenAIResponses(pool))
 	mux.HandleFunc("/v1/models", proxy.HandlePublicModels(pool))
@@ -353,6 +354,7 @@ func main() {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, X-Web-Search, X-Workspace-Search")
+			w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID, X-Notion-Capabilities, X-Notion-Ignored-Parameters")
 			if r.Method == "OPTIONS" {
 				w.WriteHeader(http.StatusOK)
 				return

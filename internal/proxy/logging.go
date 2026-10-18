@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -30,19 +31,25 @@ var debugLogTags = []string{
 }
 
 type debugFilterWriter struct {
-	mu   sync.RWMutex
-	out  io.Writer
-	file *os.File
+	mu       sync.Mutex
+	out      io.Writer
+	file     *os.File
+	path     string
+	size     int64
+	maxBytes int64
+	backups  int
 }
 
 func newDebugFilterWriter() *debugFilterWriter {
 	return &debugFilterWriter{
-		out: os.Stderr,
+		out:      os.Stderr,
+		maxBytes: 10 << 20,
+		backups:  3,
 	}
 }
 
 func init() {
-	debugLoggingEnabled.Store(true)
+	debugLoggingEnabled.Store(false)
 	log.SetOutput(globalLogWriter)
 }
 
@@ -50,17 +57,84 @@ func (w *debugFilterWriter) Write(p []byte) (int, error) {
 	if !DebugLoggingEnabled() && isDebugLogLine(p) {
 		return len(p), nil
 	}
-	w.mu.RLock()
-	out := w.out
-	w.mu.RUnlock()
-	if out == nil {
-		out = os.Stderr
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.path == "" {
+		if w.out == nil {
+			return os.Stderr.Write(p)
+		}
+		return w.out.Write(p)
 	}
-	return out.Write(p)
+	if w.size > 0 && int64(len(p)) <= w.maxBytes && w.size+int64(len(p)) > w.maxBytes {
+		if err := w.rotate(); err != nil {
+			return 0, err
+		}
+	}
+	written := 0
+	for len(p) > 0 {
+		if w.size >= w.maxBytes {
+			if err := w.rotate(); err != nil {
+				return written, err
+			}
+		}
+		if w.file == nil {
+			return written, fmt.Errorf("log file is unavailable")
+		}
+		chunk := p
+		if remaining := w.maxBytes - w.size; int64(len(chunk)) > remaining {
+			chunk = p[:int(remaining)]
+		}
+		n, err := w.file.Write(chunk)
+		written += n
+		w.size += int64(n)
+		if err != nil {
+			return written, err
+		}
+		if n != len(chunk) {
+			return written, io.ErrShortWrite
+		}
+		p = p[n:]
+	}
+	return written, nil
+}
+
+func (w *debugFilterWriter) rotate() (err error) {
+	if w.file != nil {
+		if err = w.file.Close(); err != nil {
+			return err
+		}
+		w.file = nil
+	}
+	defer func() {
+		f, openErr := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if openErr == nil {
+			w.file = f
+			w.out = f
+			if info, statErr := f.Stat(); statErr == nil {
+				w.size = info.Size()
+			} else {
+				openErr = statErr
+			}
+		}
+		if err == nil {
+			err = openErr
+		}
+	}()
+	if err = os.Remove(fmt.Sprintf("%s.%d", w.path, w.backups)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	for index := w.backups - 1; index >= 1; index-- {
+		if err = os.Rename(fmt.Sprintf("%s.%d", w.path, index), fmt.Sprintf("%s.%d", w.path, index+1)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return os.Rename(w.path, w.path+".1")
 }
 
 func (w *debugFilterWriter) SetOutputPath(path string) error {
 	path = strings.TrimSpace(path)
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
 	target := io.Writer(os.Stderr)
 	var file *os.File
@@ -73,19 +147,28 @@ func (w *debugFilterWriter) SetOutputPath(path string) error {
 			}
 		}
 
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 		if err != nil {
+			return err
+		}
+		if err = f.Chmod(0600); err != nil {
+			_ = f.Close()
 			return err
 		}
 		target = f
 		file = f
 	}
 
-	w.mu.Lock()
 	oldFile := w.file
 	w.out = target
 	w.file = file
-	w.mu.Unlock()
+	w.path = path
+	w.size = 0
+	if file != nil {
+		if info, err := file.Stat(); err == nil {
+			w.size = info.Size()
+		}
+	}
 
 	if oldFile != nil && oldFile != file {
 		_ = oldFile.Close()

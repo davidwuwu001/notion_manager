@@ -82,6 +82,7 @@ var upgradeProtocolCases = []struct{ path, protocol string }{
 func (f upgradeProtocolFixture) serve(t *testing.T, path string, stream bool, messages []map[string]string, ctx context.Context, headers ...http.Header) *httptest.ResponseRecorder {
 	t.Helper()
 	request := map[string]any{"model": "integration-model", "stream": stream, "max_tokens": 32}
+	request["metadata"] = map[string]string{"session_id": t.Name()}
 	if strings.HasSuffix(path, "/responses") {
 		request["input"] = messages
 	} else {

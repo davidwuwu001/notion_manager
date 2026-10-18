@@ -453,6 +453,7 @@ func SaveAccountToFile(acc *Account, dir string) (string, error) {
 	}
 	if quota.Info != nil {
 		data["quota_info"] = map[string]interface{}{
+			"sources":               quota.Info.Sources,
 			"rate_limit":            quota.Info.RateLimit,
 			"rate_limit_error":      quota.Info.RateLimitError,
 			"is_eligible":           quota.Info.IsEligible,

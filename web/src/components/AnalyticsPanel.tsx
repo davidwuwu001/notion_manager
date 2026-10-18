@@ -7,7 +7,7 @@ import { buttonClass, Coverage, Metric, Panel, RequestFilters, RequestMetrics, R
 export function AnalyticsPanel() {
   const { t } = useTranslation()
   const [filters, setFilters] = useState({ ...emptyLogFilters })
-  const analytics = useAdminResource(signal => fetchAnalytics(filters, signal), [filters])
+  const analytics = useAdminResource(signal => fetchAnalytics(filters, signal), [filters], 15000)
   const data = analytics.data
   return <div>
     <div className="flex justify-between gap-3 items-center mb-5"><h1 className="text-xl font-semibold">{t('upgrade.analytics')}</h1><button className={buttonClass} onClick={analytics.reload}>{t('upgrade.refresh')}</button></div>

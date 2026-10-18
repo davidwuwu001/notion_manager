@@ -277,6 +277,7 @@ func streamWebSearch(w http.ResponseWriter, flusher http.Flusher, acc *Account, 
 		})
 	}
 
+	upstreamStarted := time.Now()
 	err := inferenceCaller(acc, messages, model, false, func(delta string, done bool, usage *UsageInfo) {
 		if delta != "" {
 			// Check for new thinking blocks on each text delta
@@ -288,6 +289,7 @@ func streamWebSearch(w http.ResponseWriter, flusher http.Flusher, acc *Account, 
 		}
 	}, callOpts)
 
+	TraceRequest(inferenceContext(w)).RecordStage("upstream", time.Since(upstreamStarted))
 	// Emit any remaining thinking blocks (e.g., if no text was produced)
 	emitPendingThinking()
 
@@ -525,7 +527,7 @@ func prepareToolBridgeResponse(content string, nativeToolUses []AgentValueEntry)
 				if prepared.DoneText == "" {
 					prepared.DoneText = tc.Function.Arguments
 				}
-				log.Printf("[bridge] __done__ intercepted: %s", prepared.DoneText)
+				log.Printf("[bridge] __done__ intercepted (%d bytes)", len(prepared.DoneText))
 			} else {
 				realCalls = append(realCalls, tc)
 			}
@@ -630,7 +632,7 @@ func extractAnthropicSessionSalt(metadata map[string]interface{}) string {
 				}
 				return ""
 			}
-			return trimmed
+			return ""
 		case map[string]interface{}:
 			if sid, ok := tv["session_id"].(string); ok && strings.TrimSpace(sid) != "" {
 				return strings.TrimSpace(sid)
@@ -639,12 +641,12 @@ func extractAnthropicSessionSalt(metadata map[string]interface{}) string {
 		return ""
 	}
 
-	for _, key := range []string{"prompt_cache_key", "session_id", "conversation_id", "user_id"} {
-		if sid := extractFromValue(metadata[key]); sid != "" {
-			return sid
+	for _, key := range []string{"session_id", "conversation_id"} {
+		if sid, ok := metadata[key].(string); ok && strings.TrimSpace(sid) != "" {
+			return strings.TrimSpace(sid)
 		}
 	}
-	return ""
+	return extractFromValue(metadata["user_id"])
 }
 
 func stripStructuredOutputSystemNoise(content string) string {
@@ -745,7 +747,10 @@ func handlePremiumFeatureUnavailable(pool *AccountPool, acc *Account) {
 // HandleAnthropicMessages returns an HTTP handler for the /v1/messages endpoint (Anthropic Messages API)
 func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		requestID := "msg_" + generateUUIDv4()
+		requestID := RequestIDFromContext(r.Context())
+		if requestID == "" {
+			requestID = "msg_" + generateUUIDv4()
+		}
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
 		response := &inferenceWriter{ResponseWriter: w, ctx: ctx, cancel: cancel}
@@ -766,6 +771,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			writeAnthropicError(w, requestID, http.StatusBadRequest, "request body is required", "invalid_request_error")
 			return
 		}
+		setBridgeCompatibilityHeaders(w, bodyBytes)
 		if json.Valid(bodyBytes) {
 			LogAPIInputJSONBytes(requestID, "incoming /v1/messages request", bodyBytes)
 		} else {
@@ -931,6 +937,10 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			// instead of using Notion's server-side search which actually executes.
 			var toolDetectedWebSearch bool
 			convertedTools, toolDetectedWebSearch = filterNativeSearchTools(convertedTools)
+			if len(convertedTools) > 0 && detectModelFamily(model) != familyAnthropic {
+				writeAnthropicError(w, requestID, http.StatusBadRequest, "custom tool bridge is supported only for Claude models; see /v1/capabilities", "invalid_request_error")
+				return
+			}
 			if toolDetectedWebSearch {
 				enableWebSearch = true
 				log.Printf("[bridge] WebSearch/WebFetch detected — enabling Notion native search, stripping history")
@@ -941,8 +951,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			if DebugLoggingEnabled() {
 				log.Printf("[debug] === After structured output bridge (%d messages) ===", len(messages))
 				for i, m := range messages {
-					preview := truncateForLog(m.Content, 300)
-					log.Printf("[debug]   [%d] role=%s toolcalls=%d content_len=%d: %s", i, m.Role, len(m.ToolCalls), len(m.Content), preview)
+					log.Printf("[debug]   [%d] role=%s toolcalls=%d content_len=%d", i, m.Role, len(m.ToolCalls), len(m.Content))
 				}
 			}
 		}
@@ -970,7 +979,9 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			if !isFirstTurn && session != nil {
 				boundID = session.AccountID
 			}
+			selectionStarted := time.Now()
 			acc, release, selectionErr := pool.SelectForRequest(resolvedModel, isResearcher, tried, boundID)
+			trace.RecordStage("account_selection", time.Since(selectionStarted))
 			if selectionErr != nil {
 				trace.FinishFailure("failed", "pool_unavailable")
 				writeAnthropicError(w, requestID, http.StatusServiceUnavailable, selectionErr.Error(), "overloaded_error")
@@ -992,7 +1003,15 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			// Live quota pre-check: ensure the cached state is fresh enough
 			// that we don't waste an inference call on an exhausted account.
 			// Researcher mode has its own picker that already inspects quota.
-			if !isResearcher && !pool.RefreshAccountQuota(acc, liveCheckInterval) {
+			quotaStarted := time.Now()
+			quotaEligible := isResearcher || pool.RefreshAccountQuotaContext(ctx, acc, liveCheckInterval)
+			trace.RecordStage("quota_check", time.Since(quotaStarted))
+			if ctx.Err() != nil {
+				release()
+				trace.FinishCancelled()
+				return
+			}
+			if !quotaEligible {
 				log.Printf("[quota-live] %s skipped (exhausted on live check)", acc.UserEmail)
 				tried[acc.AccountID] = true
 				pool.MarkInferenceUnavailable(acc)
@@ -1014,9 +1033,8 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 				if DebugLoggingEnabled() && attempt == 0 {
 					log.Printf("[debug] === After tool injection (%d messages) ===", len(attemptMessages))
 					for i, m := range attemptMessages {
-						preview := truncateForLog(m.Content, 300)
-						log.Printf("[debug]   [%d] role=%s toolcalls=%d content_len=%d: %s",
-							i, m.Role, len(m.ToolCalls), len(m.Content), preview)
+						log.Printf("[debug]   [%d] role=%s toolcalls=%d content_len=%d",
+							i, m.Role, len(m.ToolCalls), len(m.Content))
 					}
 				}
 			}
@@ -1064,8 +1082,8 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 				uploadPlan := buildAttachmentUploadPlan(currentSession.ThreadID, len(fileAttachments), isFirstTurn)
 				for i, fa := range fileAttachments {
 					target := uploadPlan[i]
-					log.Printf("[upload-debug] %s: uploading attachment %d/%d: %s (%s, %d bytes)",
-						requestID, i+1, len(fileAttachments), fa.FileName, fa.ContentType, len(fa.Data))
+					log.Printf("[upload-debug] %s: uploading attachment %d/%d (%s, %d bytes)",
+						requestID, i+1, len(fileAttachments), fa.ContentType, len(fa.Data))
 					uploaded, err := UploadFileToNotionThread(acc, &fa, target.ThreadID, target.CreateThread, response.ctx)
 					if err != nil {
 						attemptTrace.Finish(RequestAttemptResult{Outcome: "failed", ErrorCode: "upload_failed"})
@@ -1075,7 +1093,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 						return
 					}
 					uploadedAttachments = append(uploadedAttachments, *uploaded)
-					log.Printf("[upload-debug] %s: attachment %d uploaded: %s", requestID, i+1, uploaded.AttachmentURL)
+					log.Printf("[upload-debug] %s: attachment %d uploaded", requestID, i+1)
 				}
 			}
 
@@ -1546,6 +1564,7 @@ func streamAnthropicTextResponse(w http.ResponseWriter, acc *Account, messages [
 		}
 	}
 
+	upstreamStarted := time.Now()
 	cbErr := inferenceCaller(acc, messages, model, disableBuiltin, func(delta string, done bool, usage *UsageInfo) {
 		if delta != "" {
 			fullContent.WriteString(delta)
@@ -1567,6 +1586,7 @@ func streamAnthropicTextResponse(w http.ResponseWriter, acc *Account, messages [
 		}
 	}, callOpts)
 
+	TraceRequest(inferenceContext(w)).RecordStage("upstream", time.Since(upstreamStarted))
 	if cbErr != nil {
 		return cbErr
 	}
@@ -1717,15 +1737,26 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 	}
 
 	callOpts.NativeToolUses = &nativeToolUses
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return fmt.Errorf("streaming not supported")
+	}
+	live := &toolBridgeStream{w: w, flusher: flusher, id: requestID, model: model}
+	if hasThinking {
+		callOpts.ThinkingCallback = live.think
+	}
+	upstreamStarted := time.Now()
 	// Format-based injection: tools embedded in user messages, use normal chat path
 	cbErr := inferenceCaller(acc, messages, model, disableBuiltin, func(delta string, done bool, usage *UsageInfo) {
 		if delta != "" {
 			fullContent.WriteString(delta)
+			live.feed(delta)
 		}
 		if usage != nil {
 			finalUsage = usage
 		}
 	}, callOpts)
+	TraceRequest(inferenceContext(w)).RecordStage("upstream", time.Since(upstreamStarted))
 
 	if cbErr != nil {
 		return cbErr
@@ -1733,10 +1764,6 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 
 	contentStr := fullContent.String()
 	log.Printf("[debug] %s: fullContent=%d bytes, hasTools=%v", requestID, len(contentStr), hasTools)
-	if len(contentStr) > 0 {
-		contentHead := truncateForLog(contentStr, 200)
-		log.Printf("[debug] %s HEAD: %s", requestID, contentHead)
-	}
 
 	// Empty response: Notion returned 200 but produced no text — retry on next account
 	if len(contentStr) == 0 && len(nativeToolUses) == 0 {
@@ -1746,7 +1773,19 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 
 	var prepared preparedToolBridgeResponse
 	if hasTools {
+		parseStarted := time.Now()
 		prepared = prepareToolBridgeResponse(contentStr, nativeToolUses)
+		TraceRequest(inferenceContext(w)).RecordStage("tool_parse", time.Since(parseStarted))
+		if len(prepared.ToolCalls) < len(live.calls) {
+			return fmt.Errorf("tool stream changed after emission")
+		}
+		for i, call := range live.calls {
+			parsed := prepared.ToolCalls[i]
+			if parsed.Function != call.Function {
+				return fmt.Errorf("tool stream changed after emission")
+			}
+			prepared.ToolCalls[i] = call
+		}
 		actionDetected := prepared.HasCalls || prepared.WebSearchQuery != "" || prepared.DoneText != ""
 		if !actionDetected && detectToolBridgeNoToolResponse(prepared.Remaining) {
 			log.Printf("[bridge] %s detected no-tool identity-drift text (%d chars), requesting clean retry", requestID, len(prepared.Remaining))
@@ -1761,40 +1800,13 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 		aUsage.OutputTokens = finalUsage.CompletionTokens
 	}
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeAnthropicError(w, requestID, http.StatusInternalServerError, "streaming not supported", "api_error")
-		return nil
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-
-	// message_start
-	sendAnthropicSSE(w, flusher, "message_start", map[string]interface{}{
-		"type": "message_start",
-		"message": map[string]interface{}{
-			"id":            requestID,
-			"type":          "message",
-			"role":          "assistant",
-			"content":       []interface{}{},
-			"model":         model,
-			"stop_reason":   nil,
-			"stop_sequence": nil,
-			"usage":         map[string]interface{}{"input_tokens": aUsage.InputTokens, "output_tokens": 0},
-		},
-	})
-
-	// ping
-	sendAnthropicSSE(w, flusher, "ping", map[string]string{"type": "ping"})
+	live.start()
+	live.closeThinking("")
 
 	// Emit thinking blocks from Notion (real thinking from Sonnet 4.6 etc.)
-	blockIndex := 0
+	blockIndex := live.index
 	loggedContentBlocks := make([]AnthropicContentBlock, 0, len(thinkingBlocks)+4)
-	if hasThinking && len(thinkingBlocks) > 0 {
+	if hasThinking && !live.thinkingEmitted && len(thinkingBlocks) > 0 {
 		log.Printf("[thinking] emitting %d thinking block(s)", len(thinkingBlocks))
 		for _, tb := range thinkingBlocks {
 			sendAnthropicSSE(w, flusher, "content_block_start", map[string]interface{}{
@@ -1882,7 +1894,7 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 
 		// Stream WebSearch results in real-time (after text blocks, before tool_use)
 		if webSearchQuery != "" {
-			log.Printf("[bridge] WebSearch intercepted — streaming via Notion native search: %q", webSearchQuery)
+			log.Printf("[bridge] WebSearch intercepted (%d bytes)", len(webSearchQuery))
 			searchUsage, searchErr := streamWebSearch(w, flusher, acc, webSearchQuery, model, requestID, &blockIndex, hasThinking, outputConfigReasoningEffort(outputConfig))
 			if searchErr != nil {
 				log.Printf("[bridge] WebSearch streaming failed: %v", searchErr)
@@ -1901,7 +1913,11 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 
 		// Send tool_use blocks
 		if hasCalls {
-			for _, tc := range toolCalls {
+			for i, tc := range toolCalls {
+				if i < len(live.calls) {
+					loggedContentBlocks = append(loggedContentBlocks, AnthropicContentBlock{Type: "tool_use", ID: tc.ID, Name: tc.Function.Name, Input: json.RawMessage(tc.Function.Arguments)})
+					continue
+				}
 				sendAnthropicSSE(w, flusher, "content_block_start", map[string]interface{}{
 					"type":  "content_block_start",
 					"index": blockIndex,
@@ -1937,7 +1953,7 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 		sendAnthropicSSE(w, flusher, "message_delta", map[string]interface{}{
 			"type":  "message_delta",
 			"delta": map[string]interface{}{"stop_reason": stopReason, "stop_sequence": nil},
-			"usage": map[string]interface{}{"output_tokens": aUsage.OutputTokens},
+			"usage": map[string]interface{}{"input_tokens": aUsage.InputTokens, "output_tokens": aUsage.OutputTokens},
 		})
 		LogAPIOutputJSON(requestID, "anthropic stream tool response summary", AnthropicResponse{
 			ID:         requestID,
@@ -1998,6 +2014,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 		}
 	}
 
+	upstreamStarted := time.Now()
 	var err error
 	if hasTools {
 		callOpts.NativeToolUses = &nativeToolUses
@@ -2021,6 +2038,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 		}, callOpts)
 	}
 
+	TraceRequest(inferenceContext(w)).RecordStage("upstream", time.Since(upstreamStarted))
 	if err != nil {
 		return err
 	}
@@ -2035,7 +2053,9 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 
 	var prepared preparedToolBridgeResponse
 	if hasTools {
+		parseStarted := time.Now()
 		prepared = prepareToolBridgeResponse(content, nativeToolUses)
+		TraceRequest(inferenceContext(w)).RecordStage("tool_parse", time.Since(parseStarted))
 		actionDetected := prepared.HasCalls || prepared.WebSearchQuery != "" || prepared.DoneText != ""
 		if !actionDetected && detectToolBridgeNoToolResponse(prepared.Remaining) {
 			log.Printf("[bridge] %s detected no-tool identity-drift text (%d chars), requesting clean retry", requestID, len(prepared.Remaining))
@@ -2085,7 +2105,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 
 		// Intercept WebSearch tool calls → execute via Notion's native search
 		if prepared.WebSearchQuery != "" {
-			log.Printf("[bridge] WebSearch intercepted — executing via Notion native search: %q", prepared.WebSearchQuery)
+			log.Printf("[bridge] WebSearch intercepted (%d bytes)", len(prepared.WebSearchQuery))
 			searchResult, searchUsage, searchErr := executeWebSearch(acc, prepared.WebSearchQuery, model, requestID, outputConfigReasoningEffort(outputConfig), inferenceContext(w))
 			if searchErr == nil && searchResult != "" {
 				if doneText != "" {
@@ -2202,8 +2222,7 @@ func logAnthropicRequest(req AnthropicRequest, model string) {
 	if req.System != nil {
 		switch s := req.System.(type) {
 		case string:
-			preview := truncateForLog(s, 200)
-			log.Printf("[debug] ║ system(%d chars): %s", len(s), preview)
+			log.Printf("[debug] ║ system(%d bytes)", len(s))
 			if AppConfig.Server.DumpAPIInput {
 				os.WriteFile("claude_code_system_dump.txt", []byte(s), 0644)
 				log.Printf("[debug] ║ system dumped to claude_code_system_dump.txt")
@@ -2221,9 +2240,6 @@ func logAnthropicRequest(req AnthropicRequest, model string) {
 	// Log tools
 	if len(req.Tools) > 0 {
 		log.Printf("[debug] ║ tools(%d):", len(req.Tools))
-		for _, t := range req.Tools {
-			log.Printf("[debug] ║   - %s: %s", t.Name, t.Description)
-		}
 		if AppConfig.Server.DumpAPIInput {
 			toolDump, _ := json.MarshalIndent(req.Tools, "", "  ")
 			os.WriteFile("claude_code_tools_dump.json", toolDump, 0644)
@@ -2233,8 +2249,7 @@ func logAnthropicRequest(req AnthropicRequest, model string) {
 
 	// Log tool_choice
 	if req.ToolChoice != nil {
-		tcRaw, _ := json.Marshal(req.ToolChoice)
-		log.Printf("[debug] ║ tool_choice: %s", string(tcRaw))
+		log.Printf("[debug] ║ tool_choice configured")
 	}
 
 	// Log messages
@@ -2242,8 +2257,7 @@ func logAnthropicRequest(req AnthropicRequest, model string) {
 	for i, msg := range req.Messages {
 		switch content := msg.Content.(type) {
 		case string:
-			preview := truncateForLog(content, 200)
-			log.Printf("[debug] ║   [%d] role=%s text(%d): %s", i, msg.Role, len(content), preview)
+			log.Printf("[debug] ║   [%d] role=%s text(%d bytes)", i, msg.Role, len(content))
 		case []interface{}:
 			var blockTypes []string
 			for _, block := range content {
@@ -2258,7 +2272,6 @@ func logAnthropicRequest(req AnthropicRequest, model string) {
 						blockTypes = append(blockTypes, fmt.Sprintf("tool_result(%s)", tuID))
 					case "text":
 						text, _ := m["text"].(string)
-						text = truncateForLog(text, 80)
 						blockTypes = append(blockTypes, fmt.Sprintf("text(%d chars)", len(text)))
 					default:
 						blockTypes = append(blockTypes, bt)
@@ -2279,7 +2292,6 @@ func logConvertedMessages(messages []ChatMessage) {
 
 	log.Printf("[debug] === Converted to %d internal messages ===", len(messages))
 	for i, m := range messages {
-		preview := truncateForLog(m.Content, 200)
 		extra := ""
 		if len(m.ToolCalls) > 0 {
 			var names []string
@@ -2291,7 +2303,7 @@ func logConvertedMessages(messages []ChatMessage) {
 		if m.ToolCallID != "" {
 			extra += fmt.Sprintf(" tool_call_id=%s name=%s", m.ToolCallID, m.Name)
 		}
-		log.Printf("[debug]   [%d] role=%-9s len=%-5d%s: %s", i, m.Role, len(m.Content), extra, preview)
+		log.Printf("[debug]   [%d] role=%-9s len=%-5d%s", i, m.Role, len(m.Content), extra)
 	}
 }
 
@@ -2456,7 +2468,8 @@ func handleResearcherStream(w http.ResponseWriter, acc *Account, messages []Chat
 		}
 	}
 
-	cbErr := CallInference(acc, messages, model, false, func(delta string, done bool, usage *UsageInfo) {
+	upstreamStarted := time.Now()
+	cbErr := inferenceCaller(acc, messages, model, false, func(delta string, done bool, usage *UsageInfo) {
 		if delta != "" {
 			ensureTextBlock()
 			sendTextDelta(delta)
@@ -2473,6 +2486,7 @@ func handleResearcherStream(w http.ResponseWriter, acc *Account, messages []Chat
 		return cbErr
 	}
 
+	TraceRequest(inferenceContext(w)).RecordStage("upstream", time.Since(upstreamStarted))
 	// Close text block if started
 	if textBlockStarted {
 		sendAnthropicSSE(w, flusher, "content_block_stop", map[string]interface{}{
@@ -2549,6 +2563,7 @@ func handleResearcherNonStream(w http.ResponseWriter, acc *Account, messages []C
 		RequestID:      requestID,
 	}
 
+	upstreamStarted := time.Now()
 	cbErr := inferenceCaller(acc, messages, model, false, func(delta string, done bool, usage *UsageInfo) {
 		if delta != "" {
 			fullContent.WriteString(delta)
@@ -2565,6 +2580,7 @@ func handleResearcherNonStream(w http.ResponseWriter, acc *Account, messages []C
 		return cbErr
 	}
 
+	TraceRequest(inferenceContext(w)).RecordStage("upstream", time.Since(upstreamStarted))
 	aUsage := &AnthropicUsage{}
 	if finalUsage != nil {
 		aUsage.InputTokens = finalUsage.PromptTokens
