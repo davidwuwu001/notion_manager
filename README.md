@@ -1,357 +1,236 @@
-<div align="center">
-  <h1>notion-manager</h1>
-  <p><strong>Local account pool, dashboard, and protocol proxy for Notion AI</strong></p>
-  <p>Run multiple Notion sessions behind one local entrypoint with pooled accounts, quota visibility, a browser dashboard, an Anthropic-compatible API, bulk Microsoft-SSO account provisioning, and Claude Code compatibility.</p>
+# notion-manager｜Notion AI 账号池与管理面板
 
-  <p>
-    <img src="https://img.shields.io/badge/Go-1.25-00ADD8?style=flat-square" alt="Go">
-    <img src="https://img.shields.io/badge/API-Anthropic%20Messages-111111?style=flat-square" alt="Anthropic Messages API">
-    <img src="https://img.shields.io/badge/UI-React%20Dashboard-61DAFB?style=flat-square" alt="React Dashboard">
-    <img src="https://img.shields.io/badge/Proxy-Notion%20Web-0B0B0B?style=flat-square" alt="Notion Web Proxy">
-    <img src="https://img.shields.io/badge/Register-Microsoft%20SSO-2F2F2F?style=flat-square" alt="Microsoft SSO Bulk Register">
-  </p>
+基于 [SleepingBag945/notion_manager](https://github.com/SleepingBag945/notion_manager) 二次开发的本地 Notion AI 管理工具。保留原有 Go 协议代理，在此基础上完善正式 Business 工作区导入、动态账号池、请求日志、数据分析和模型接入体验。
 
-  <p>
-    <a href="#quick-start">Quick Start</a> •
-    <a href="#core-capabilities">Core Capabilities</a> •
-    <a href="#architecture">Architecture</a> •
-    <a href="#setup">Setup</a> •
-    <a href="#documentation">Documentation</a>
-  </p>
+> 本仓库不是 Notion 官方项目，也不是原作者的官方发行版。请只接入你有权使用的账号和工作区，遵守 Notion 的服务条款及适用规则。新增账号须核验为正式、非试用 Business 工作区；不提供免费批量开号或自动补号。
 
-  <p>
-    <strong>English</strong> |
-    <a href="./README_CN.md">简体中文</a>
-  </p>
-</div>
+## 原作者与项目来源
 
-## Origin and this modified version
+- **原项目作者：SleepingBag945 及上游贡献者。** 原仓库：[SleepingBag945/notion_manager](https://github.com/SleepingBag945/notion_manager)。
+- **本分支维护仓库：** [davidwuwu001/notion_manager](https://github.com/davidwuwu001/notion_manager)。保留原始提交历史，不将原项目能力冒称为本分支原创。
+- **管理功能参考：** [auuuu4/notion-2api-web](https://github.com/auuuu4/notion-2api-web/tree/ed467fcc9ecf6d0d8b56dcf729e626227fbee675) 的页面组织、日志和分析思路；本轮管理升级未直接复制该项目的源码、样式或图片。
+- **许可证：** 沿用原项目 [CC BY-NC-SA 4.0](LICENSE)，包含署名、非商业使用、相同方式共享等要求。仓库公开不代表可以无条件商用。完整来源说明见 [UPSTREAM-NOTICE](docs/UPSTREAM-NOTICE.md)。
 
-This repository is a modified version of [SleepingBag945/notion_manager](https://github.com/SleepingBag945/notion_manager). Credit for the original project belongs to **SleepingBag945 and the upstream contributors**; their commit history and [CC BY-NC-SA 4.0 license](LICENSE) are preserved.
+## 和原项目有什么区别？
 
-This version adds a six-page dashboard, persistent request logs and analytics, dynamic account-pool routing, verified Business-workspace imports, and quota/authentication fixes. New accounts must be verified non-trial Business workspaces; legacy registration tasks are read-only, so the upstream bulk-registration instructions below do not apply to this version. See [upstream attribution](docs/UPSTREAM-NOTICE.md) for the separate dashboard inspiration and license notes. This is not an official Notion project or an endorsement by the original author.
+下表对比的是本分支开始修改时的上游基线 [`3ce40ea`](https://github.com/SleepingBag945/notion_manager/commit/3ce40ea57f304d3195d0a18205fbf2949003683a)，不是对原作者未来版本的判断。
 
----
+| 方面 | 原项目已有能力 | 本分支新增或调整 |
+| --- | --- | --- |
+| 底层代理 | Go 引擎、Notion Web 反代、三种 API 协议、工具/文件适配 | 保留引擎，不另起 Python 后端；修正共享请求生命周期、错误及取消处理 |
+| 管理面板 | React 账号管理、历史 Token 统计、配置和注册界面 | 六页导航：概览、账号与工作区、模型与接入、请求日志、数据分析、系统设置 |
+| 账号身份 | 已有账号文件与稳定身份基础 | 将会话、调度、尝试记录和管理操作统一接到 AccountID；同邮箱不同工作区不混用 |
+| 新增账号 | 已登录会话导入、Chrome 提取、Microsoft SSO 注册 | 核验真实订阅，只接受正式非试用 Business；扩展精确选择工作区后直接导入，保留 JSON/token 备用入口 |
+| 账号池 | 多账号、额度检查、余量优先和故障跳过基础 | 面向 N 个平等成员的余量优先/全池轮询、暂停/启用、并发占位、尝试预算及可解释状态，不采用主备角色 |
+| 额度 | Basic/Premium 等兼容指标 | 新增滚动窗口/月度套餐用量；明确区分确认余额、零值、未知和缓存，不用推算覆盖真实零余额 |
+| 模型与接入 | 模型映射、标准 API 端点 | 独立模型页，从接口获取公开模型 ID；一键复制模型 ID、三种协议的 Base URL 和完整端点 |
+| 日志与统计 | 历史 Token 聚合 | SQLite 持久化逐请求/逐尝试轨迹，筛选分页、成功率、趋势、模型/账号分布、平均/P50/P95 延迟 |
+| 管理安全 | 管理密码和会话基础 | 未登录 HTML 不注入 API Key，管理模型/连接信息经登录态读取；新增结构化日志不保存对话正文和凭据 |
+| 批量注册 | Microsoft SSO 注册、注册任务与重试 | 本分支的服务入口禁止新建/启动/重试注册任务，仅保留历史任务只读；不把旧注册 CLI 作为加号途径 |
 
-<p align="center">
-  <img src="img/dashboard.png" alt="Dashboard" width="900">
-</p>
+三协议代理、Web 反代、基础工具桥接、ASK 模式和上游代理支持均来自原项目，本分支是在这些能力上改进，不是从零实现。
 
-**notion-manager** is a local Notion AI management tool. It extracts live Notion sessions through the bundled Chrome extension (or provisions fresh ones via bulk Microsoft-SSO), builds a multi-account pool, refreshes quota and model state in the background, and exposes four practical entrypoints:
+## 本分支更新记录
 
-- `Dashboard` at `/dashboard/` — pool view, token usage stats, bulk register
-- `Reverse Proxy` for the full Notion AI web UI at `/ai`
-- `API gateway` — `POST /v1/messages` (Anthropic), `POST /v1/chat/completions`, `POST /v1/responses`, `GET /v1/models` (OpenAI), with `GET /models` as an alias
-- `Bulk register` at `POST /admin/register/start` (provider-pluggable)
+### 2026-10-18：管理、账号池与可观测性升级
 
-### Environment startup accounts
+- **套餐用量展示（`3945f6a`）：** 接入 Notion AI 滚动窗口和月度用量、重置时间；与旧 Basic/Premium 分开展示。
+- **模型与接入页（`148ab51`）：** 增加模型目录、公开模型 ID 复制、OpenAI Chat / Anthropic Messages / OpenAI Responses 地址复制。
+- **账号池与管理升级（`f618539`）：** 六页后台、正式 Business 导入校验、多工作区身份隔离、余量优先/轮询、成员暂停、并发与重试预算、SQLite 请求日志及分析。
+- **错误与数据修正：** 401 归类为认证异常，不冒充额度耗尽；明确零余额不被“总额减已用”覆盖；缺失余额显示未知；失败/取消/部分输出不无条件计成功。
+- **来源说明（`034bdec`）：** 补充原作者、继承能力、本分支改动及参考项目声明；保留原许可证和提交历史。
 
-Set `NOTION_TOKEN_V2` to discover and persist an account at startup. For
-browser sessions containing multiple Notion accounts, the optional
-`NOTION_ACTIVE_USER_ID`, `NOTION_SPACE_ID`, and `NOTION_EXPECTED_EMAIL`
-selectors pin discovery to the intended account and workspace.
+这些短提交号可以在本仓库的提交历史中查看。功能说明不是对所有模型、所有客户端或长期运行稳定性的保证。
 
-Up to 15 additional accounts can be imported at startup with
-`NOTION_TOKEN_V2_2` through `NOTION_TOKEN_V2_16`. Each additional account has
-its own optional selectors: `NOTION_ACTIVE_USER_ID_2` through
-`NOTION_ACTIVE_USER_ID_16`, `NOTION_SPACE_ID_2` through `NOTION_SPACE_ID_16`,
-and `NOTION_EXPECTED_EMAIL_2` through `NOTION_EXPECTED_EMAIL_16`. Startup first
-discovers every configured account, deduplicates by `account_id`, and then
-persists the accounts one by one. It activates the pool only after every save
-succeeds.
+## 六个管理页面
 
-## Quick Start
+| 页面 | 地址 | 主要用途 |
+| --- | --- | --- |
+| 概览 | `/dashboard/#overview` | 全池状态、请求数/成功率、趋势、最近请求和历史 Token 汇总 |
+| 账号与工作区 | `/dashboard/#accounts` | 导入、搜索、配额刷新、工作区 ID 复制、成员暂停/启用和打开代理 |
+| 模型与接入 | `/dashboard/#models` | 获取模型清单，复制模型 ID、API Key 和三协议接入地址 |
+| 请求日志 | `/dashboard/#logs` | 按时间、状态、模型、协议、账号和请求 ID 筛选，查看尝试轨迹 |
+| 数据分析 | `/dashboard/#analytics` | 请求趋势、模型/工作区分布、成功率和延迟分位数 |
+| 系统设置 | `/dashboard/#settings` | 搜索/ASK/上游代理、调度策略、尝试预算、单账号并发和日志保留 |
 
-> **Prerequisites:** Go 1.25+, at least one Notion account. No Chrome extension needed if you only plan to add accounts via the dashboard.
+直接打开 `/dashboard/` 默认进入账号页，页面使用 hash 导航，不需要额外部署前端服务器。
+
+## 快速开始
+
+### 1. 准备环境并启动
+
+- **Go 1.26.0 或更高版本**，以 [go.mod](go.mod) 为准。
+- 能访问 GitHub 依赖源和 Notion 的网络环境。
+- 至少一个你有权使用、可核验订阅的正式 Business 工作区。
+- Chrome/Chromium 仅在使用扩展导入时需要。默认运行无需 Docker、外部数据库或 Python 服务。
 
 ```bash
-# 1. Clone & run (config auto-generated on first start)
-git clone https://github.com/SleepingBag945/notion_manager.git
+git clone https://github.com/davidwuwu001/notion_manager.git
 cd notion_manager
 go run ./cmd/notion-manager
 ```
 
-On first run, the console prints your **admin password** and **API key** — save them.
+仓库包含已构建的内嵌前端，单纯运行不必先安装 Node.js。首次启动会生成本地 `config.yaml`；未配置管理密码时会显示一次随机明文密码，之后保存哈希，请妥善保存。API Key 可在登录后的“模型与接入”页查看/复制。
 
-```bash
-# 2. Open the Dashboard
-http://localhost:8081/dashboard/
-```
-
-**Add your first account** (pick one):
-
-- **Existing Notion session** — In Chrome open `notion.so` → `F12` → **Application** → **Cookies** → copy `token_v2`. In the Dashboard click **「+ 添加账号」** and paste it.
-- **Bulk Microsoft-SSO** — In the Dashboard click **「注册账号」** and paste `email----password----client_id----refresh_token` lines. See [Bulk Registration](docs/registration.md) for credential prep.
-
-The pool hot-reloads as soon as a new JSON lands in `accounts/` — no restart needed.
-
-```bash
-# 3. Use the API (Claude Code, Cherry Studio, curl, etc.)
-export ANTHROPIC_BASE_URL=http://localhost:8081
-export ANTHROPIC_API_KEY=<your-api-key>
-claude  # or any Anthropic-compatible client
-
-# OpenAI-compatible clients hit the same server:
-export OPENAI_BASE_URL=http://localhost:8081/v1
-export OPENAI_API_KEY=<your-api-key>
-```
-
-Or download a pre-built binary from [Releases](https://github.com/SleepingBag945/notion_manager/releases) — no Go toolchain required.
-
----
-
-## Core Capabilities
-
-### Multi-account pool
-
-- Load any number of account JSON files from `accounts/`
-- Pick accounts by effective remaining quota instead of naive random routing
-- Live per-request quota check (cached for `refresh.live_check_seconds`) so an account that just exhausted doesn't poison the next call
-- Skip exhausted / no-workspace accounts automatically
-- Persist refreshed quota and discovered models back into account JSON files
-- Use a separate account selection path for researcher mode
-
-### Dashboard
-
-- Embedded React dashboard at `/dashboard/`
-- Password login with session cookies
-- Pool view with **server-side search, sort, and pagination** (`q`, `page`, `page_size`)
-- Per-account actions: open proxy, copy token, **delete account file + pool entry**
-- Token usage statistics page — lifetime totals, today, last 24h, 30-day series, top-N models, top-N accounts
-- Toggle `enable_web_search`, `enable_workspace_search`, `ask_mode_default`, `debug_logging`
-- Edit upstream `notion_proxy` URL at runtime without a restart
-- **Bulk register drawer** with per-job concurrency, optional per-job upstream proxy, live SSE progress, and one-click retry of failed rows
-
-### Reverse proxy for Notion Web
-
-- Create a targeted proxy session through `/proxy/start`
-- Open the full Notion AI experience locally through `/ai`
-- Inject pooled account cookies automatically
-- Proxy HTML, `/api/*`, static assets, `msgstore`, and WebSocket traffic
-- Rewrite Notion frontend base URLs and strip analytics scripts
-- Refuse to redirect into an account whose Notion workspace is missing (returns `409` so the dashboard can show the user instead of opening a dead tab)
-
-### API compatibility (Anthropic + OpenAI)
-
-- `POST /v1/messages` — Anthropic Messages API
-- `POST /v1/chat/completions` — OpenAI Chat Completions API
-- `POST /v1/responses` — OpenAI Responses API
-- `GET /v1/models` — OpenAI models API
-- `GET /models` — compatibility alias for `/v1/models`
-- Supports both `Authorization: Bearer <api_key>` and `x-api-key: <api_key>`
-- Streaming and non-streaming responses
-- Anthropic `tools` and OpenAI `tools` / `function_call`
-- File inputs for images, PDFs, and CSVs reuse the existing Notion upload pipeline
-- Default model fallback via `proxy.default_model`
-- `previous_response_id` is intentionally unsupported in `/v1/responses` (stateless bridge)
-- **ASK mode** — append `-ask` to any model name (e.g. `sonnet-4.6-ask`) for a read-only single turn that mirrors Notion's frontend "Ask" toggle, or set `proxy.ask_mode_default: true` to make every request ASK by default
-
-### Bulk Microsoft-SSO registration
-
-- Provision Notion accounts in bulk by feeding `email----password----client_id----refresh_token` lines
-- Drives the full MSA → Notion onboarding flow (consent, MFA proofs via paired peer mailbox, space creation, plan probe)
-- Provider-pluggable architecture (`internal/regjob/providers/...`) — Microsoft is the first provider; future OAuth integrations (Google, GitHub, …) drop in via the same interface
-- Per-job upstream proxy (HTTP/HTTPS/SOCKS5) — beats the global `proxy.notion_proxy`
-- Live job state persisted to `accounts/.register_history.json`; SSE event stream at `/admin/register/jobs/{id}/events`
-- One-click retry of just the failed rows (raw inputs preserved sidecar-style)
-- Standalone CLI mirror at `cmd/register/` (pipe credentials via stdin or `-input`)
-
-See [Bulk Registration](docs/registration.md) for the protocol, schema, and dashboard walkthrough.
-
-### Upstream proxy for all Notion traffic
-
-- `proxy.notion_proxy` (env `NOTION_PROXY`, dashboard editable) tunnels every Notion-bound HTTPS connection — `/v1/messages`, `/admin/refresh`, `/ai` reverse proxy, `msgstore`, WebSocket, **and** the bulk-register MSA flow
-- Schemes: `http`, `https`, `socks5`, `socks5h`
-- Per-bulk-register-job override available in the dashboard register modal; empty modal value falls back to the global URL
-
-### Token usage statistics
-
-- `GET /admin/stats` — lifetime + today + last 24h + 30-day daily series + top-5 models + top-5 accounts
-- Persisted to `accounts/.token_stats.json`, flushed every 5 s, survives restarts
-- Recorded automatically on every successful inference (no extra wiring required)
-
-<p align="center">
-  <img src="img/cherry.jpg" alt="Cherry Studio" width="480"><br>
-  <em>Works with <a href="https://github.com/CherryHQ/cherry-studio">Cherry Studio</a> — a multi-LLM desktop client</em>
-</p>
-
-### Claude Code Integration
-
-Compatible with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — Anthropic's official agentic coding tool. Multi-turn tool chaining, file operations, shell commands, and extended thinking work through Notion AI via a [three-layer compatibility bridge](docs/claude-code-integration.md).
-
-<p align="center">
-  <img src="img/claude-code-demo.jpg" alt="Claude Code Demo" width="480"><br>
-  <em>Claude Code analyzing project architecture through notion-manager — multi-turn tool chaining with session persistence</em>
-</p>
-
-<p align="center">
-  <img src="img/claude-code-demo_2.jpg" alt="Claude Code Thinking" width="480"><br>
-  <em>Extended thinking support — Claude Code's reasoning chain is fully streamed</em>
-</p>
-
-**Setup** — just two environment variables:
-
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:8081
-export ANTHROPIC_API_KEY=your-api-key
-claude  # start interactive session
-```
-
-**What works**: Shell commands, file read/write/edit, file search (Glob/Grep), web search, multi-turn tool chaining, extended thinking, streaming, model selection (Opus/Sonnet/Haiku).
-
-**How it works**: Notion AI's ~27k server-side system prompt creates a strong "I am Notion AI" identity that refuses external tool calls. The proxy bypasses this by (1) dropping conflicting system prompts, (2) stripping XML control tags, and (3) reframing requests as code generation ("unit test" framing). A `__done__` pseudo-function keeps the model permanently in JSON output mode — it never switches to "respond as assistant" mode, which would trigger Notion AI identity regression. See [Claude Code Integration Details](docs/claude-code-integration.md) for the full technical explanation and [Notion's system prompt](docs/notion_system_prompt.md).
-
-**Limitations**: Only 8 core tools (of 18+) are supported (larger tool lists break the framing), latency is higher per turn, and management tools (Agent, MCP, LSP) are filtered out.
-
-### Research mode and search control
-
-- Use `researcher` or `fast-researcher` as the model name
-- Streams thinking blocks and final report text
-- Request-level search control via `X-Web-Search` and `X-Workspace-Search`
-- Search precedence is request headers > dashboard/config > defaults
-
-## Architecture
-
-```mermaid
-graph TD
-    A[Chrome Extension] -->|extract account JSON| B[accounts/*.json]
-    R[Bulk register input] -->|email----password----client_id----refresh_token| RJ[regjob runner]
-    RJ -->|MSA + Notion onboarding| B
-    B --> C[Account Pool]
-    C -->|live quota check| C
-    D[Dashboard /dashboard/] -->|session auth| E[Admin API]
-    E --> C
-    E --> ST[(token_stats.json)]
-    E --> RH[(register_history.json)]
-    F[API Client] -->|POST /v1/messages| G[Anthropic Handler]
-    G --> C
-    G --> H[Uploads / tools / search control / ASK mode]
-    H --> I[Notion AI API]
-    J[Browser] -->|/proxy/start -> /ai| K[Reverse Proxy]
-    K --> C
-    K --> L[notion.so / msgstore]
-    G -.notion_proxy.-> P[Upstream proxy]
-    RJ -.notion_proxy.-> P
-    K -.notion_proxy.-> P
-    P --> I
-    P --> L
-```
-
-## Setup
-
-### Requirements
-
-- Go `1.25+` (or grab a [Release](https://github.com/SleepingBag945/notion_manager/releases) pre-built binary if you want to skip the Go toolchain)
-- Chrome or Chromium for the extension workflow (skip if you only use the dashboard "Add account" or bulk register)
-- At least one usable Notion account
-
-The repo already includes embedded dashboard assets, so `go run` is enough if you only want to run the service.
-
-### 1. Get accounts into the pool
-
-You have two parallel ways to populate `accounts/`. Mix and match — the pool just loads whatever JSON files end up in the directory.
-
-#### Option A — Chrome extension (existing logged-in sessions)
-
-1. Open `chrome://extensions`
-2. Enable developer mode
-3. Load `chrome-extension/`
-4. Open a logged-in `https://www.notion.so/`
-5. Click the extension and extract the config
-6. Save the result into `accounts/<name>.json`
-
-#### Option B — Bulk Microsoft-SSO registration (fresh accounts)
-
-Drive the dashboard's `+ Register` drawer or the standalone CLI:
-
-```bash
-# CLI: drop one line per account into stdin or -input
-notion-manager-register -accounts ./accounts -input creds.txt
-```
-
-Each line has four fields, separated by `----`:
+打开管理面板：
 
 ```text
-<email>----<password>----<client_id>----<refresh_token>
+http://127.0.0.1:8081/dashboard/
 ```
 
-The runner pairs adjacent rows for second-factor email proofs (row N's mailbox is used as N+1's verification target), so always paste credentials in **even** counts. See [Bulk Registration](docs/registration.md) for the full flow, retry semantics, and dashboard SSE protocol.
+默认监听本机 `127.0.0.1:8081`。已有配置或 `PORT` 环境变量可以改变端口；本文示例统一使用 8081。不要把账号文件、管理密码或 API Key 提交到 Git。
 
-Example pool layout:
+### 2. 导入账号与工作区
 
-```text
-accounts/
-  alice.json                 # from the Chrome extension
-  alice_outlook_com.json     # from bulk register (filename derived from email)
-  team-a.json
-  backup.json
-```
+**推荐：Chrome 扩展直接导入**
 
-### 2. Configure `config.yaml`
+1. 在 Chrome 登录 Notion，并打开要导入账号的 `notion.so` 或 `notion.com` 官方工作区页面。
+2. 打开 `chrome://extensions`，开启开发者模式，加载仓库内的 `chrome-extension/`；也可在管理面板“添加账号”中下载同版本扩展包，解压后加载。
+3. 在同一个 Chrome 中打开并登录本机管理面板，保持 `http://127.0.0.1:8081/dashboard/` 可访问。
+4. 回到 Notion 页面，点击扩展读取当前账号，**选择具体工作区**，确认是正式 Business 后点击直接导入。
+5. 在账号页核对工作区 ID 和订阅核验状态。同邮箱、同名工作区也应按 ID 区分，不要仅凭显示名称判断。
 
-Copy the example config and edit as needed:
+扩展只在你点击操作时，将必要登录凭据提交到上述本机管理服务；它需要读取 Notion Cookie 的权限。这不是 Notion 官方 OAuth 授权，也不支持仅输入一个网址就无权限读取所有登录凭据。浏览器切换账号后应重新读取，不要沿用旧提取结果。
+
+**备用：JSON / token 导入**
+
+扩展可导出账号 JSON；在管理面板“添加账号”中选择文件，或使用 token 入口。服务端仍会核验身份、目标工作区和正式 Business 订阅，不能通过备用入口绕过校验。多工作区会话应明确指定正确的用户/工作区，而不是任选首项。
+
+JSON 含等同于登录态的敏感凭据，不要发到聊天、公开 Issue 或仓库。导入结果不明时先检查账号池，避免盲目重复操作。扩展直接导入地址目前固定为 127.0.0.1:8081；自定义端口时请使用管理面板的备用导入方式。
+
+### 3. 接入客户端
+
+先在“模型与接入”复制当前可用模型 ID 和 API Key。模型清单取决于账号、工作区、权限及上游状态，本文不固定模型数量，也不保证列出即必然调用成功。
+
+| 协议 | 客户端 Base URL | 完整请求地址 |
+| --- | --- | --- |
+| OpenAI Chat Completions | `http://127.0.0.1:8081/v1` | `POST http://127.0.0.1:8081/v1/chat/completions` |
+| Anthropic Messages | `http://127.0.0.1:8081` | `POST http://127.0.0.1:8081/v1/messages` |
+| OpenAI Responses | `http://127.0.0.1:8081/v1` | `POST http://127.0.0.1:8081/v1/responses` |
+
+OpenAI Base URL 已包含 `/v1`，不要重复追加。模型列表为 `GET /v1/models`，`GET /models` 为兼容别名。API 支持 Bearer 或 `x-api-key`；管理页使用独立的管理登录会话。
+
+**Claude Code 示例**
 
 ```bash
-cp example.config.yaml config.yaml
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8081
+export ANTHROPIC_API_KEY='替换为面板复制的 API Key'
+export ANTHROPIC_MODEL='替换为模型页可用的模型 ID'
+claude
 ```
 
-- `server.port` sets the listening port
-- `server.admin_password` can be set manually or left empty for auto-generation
+Cherry Studio 等 OpenAI 兼容客户端填写上述 OpenAI Base URL、API Key 和模型 ID。不要把本地服务的 API Key 当成 Notion Cookie，也不要使用原作者旧发行包验证本分支新增能力。
 
-You can also skip this step entirely — the service will start with defaults and auto-generate `config.yaml` with a random API key and admin password.
+**最小请求示例**
 
-Important:
-
-- If `server.api_key` is empty, startup generates one and writes it back to `config.yaml`
-- If `server.admin_password` is empty, startup generates a random password, prints it to the console, hashes it, and writes it back — save the plaintext shown on first run
-- If `server.admin_password` is plaintext, startup replaces it with a salted SHA256 hash
-
-### 3. Run
+以下占位值需要替换，不含可用凭据：
 
 ```bash
-go run ./cmd/notion-manager
-```
-
-If you change the dashboard source under `web/`, rebuild it with `npm run build` inside `web/`, then sync the output into `internal/web/dist/`.
-
-Examples below use port `3000` from `example.config.yaml`. If you start without a `config.yaml`, the default port is `8081`.
-
-### 4. Verify
-
-```bash
-curl http://localhost:3000/health
-```
-
-Open:
-
-```text
-http://localhost:3000/dashboard/
-```
-
-Basic API call:
-
-```bash
-curl http://localhost:3000/v1/messages \
-  -H "Authorization: Bearer <api_key>" \
-  -H "Content-Type: application/json" \
+curl http://127.0.0.1:8081/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'x-api-key: YOUR_LOCAL_API_KEY' \
   -d '{
-    "model": "sonnet-4.6",
-    "max_tokens": 512,
-    "messages": [
-      { "role": "user", "content": "Summarize what notion-manager does." }
-    ]
+    "model": "YOUR_AVAILABLE_MODEL_ID",
+    "max_tokens": 128,
+    "messages": [{"role": "user", "content": "你好"}]
   }'
 ```
 
-## Documentation
+## 账号池怎样切换？
 
-- [API Usage](docs/api.md) — Standard requests, OpenAI compatibility, search overrides, file uploads, research mode, ASK mode
-- [Dashboard & Proxy](docs/dashboard.md) — Dashboard login, pool view, register drawer, stats panel, proxy session workflow
-- [Bulk Registration](docs/registration.md) — Microsoft-SSO provisioning, providers, jobs, SSE, retry, sidecar inputs
-- [Configuration](docs/configuration.md) — Full config reference, endpoints, environment variables
-- [Claude Code Integration](docs/claude-code-integration.md) — How Claude Code works through Notion AI, capabilities, and limitations
-- [Notion System Prompt](docs/notion_system_prompt.md) — Notion AI's full server-side system prompt (~27k tokens)
+所有启用、符合条件的成员平等参与，没有“一个主号、一个备号”的固定结构。可以持续添加第 3、4、5 个及更多成员。
 
-## License
+- **余量优先（默认）：** 优先依据已知滚动/月度额度的可比较余量选路；同等条件轮转，不把不同单位直接相加。
+- **全池轮询：** 在当前合格、可用的成员之间分配新会话，跳过暂停、耗尽、冷却、失效或不支持目标模型的成员。
+- **已有会话：** 优先复用仍可用的 AccountID，避免每轮随意跳工作区。
+- **故障隔离：** 区分认证异常、短期限流、窗口/账期耗尽、模型不可用和网络故障；登录失效需要重新导入，不自动恢复 Cookie。
+- **恢复检查：** 冷却或已知重置时间到期后复核；手动暂停的成员不会自动启用。
+- **边界设置：** 尝试预算 `0` 表示以当前账号池规模为上界，并非无限重试；每账号并发 `0` 表示不限，限额分别作用于各成员。
 
-This project is licensed under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/). Non-commercial use only.
+**并非任意失败都能透明切号。** 已输出内容、工具调用、文件上传、工作区搜索或副作用不明时，不能为了继续回答而跨工作区重放。只在安全边界和预算内尝试其它成员。`/ai` 网页代理也不会自动把文档和权限迁移到另一个工作区。
+
+新增账号严格核验 Business；旧账号保留 `legacy_unverified` 等历史状态，不会仅凭旧 `plan_type=team` 或 Premium 余额把它们标为已核验。存量保留与新增门槛是两个概念。
+
+## 额度、日志和统计怎么看？
+
+- 套餐滚动/月度用量与兼容 Basic/Premium **分开计量**；没有已确认的一比一换算。
+- 条形和 `已用 / 总额` 展示的是消耗；“剩余”“未知”“缓存”分别表达不同含义。
+- 上游明确余额为 `0` 就保留 `0`，不会擅自推算成正余额；缺失或 `null` 不伪装成已确认余额。
+- 额度刷新失败保留最后成功检查的数据和时间，不显示为刚刷新成功或全部清零。
+- 一次外部请求只计一次；内部转换、账号重试记在尝试轨迹中，不膨胀请求数。
+- HTTP 200 不等于流式完成成功；失败、取消、重启中断和进行中分开统计。
+- 延迟分位数在同一筛选窗口内按成功请求计算；未知 Token 为 `—`，不是零。
+- 新日志自启用时开始采集，默认保留 30 天并显示覆盖区间；旧 Token 汇总不会反推成不存在的历史请求。缩短保留期会清理新库中的过期记录。
+
+## 配置、数据与安全
+
+常用请求设置可在“系统设置”修改，更多配置见 [example.config.yaml](example.config.yaml)。`proxy.ask_mode_default` 可让请求默认使用 ASK 只读模式；也可在模型 ID 后加 `-ask`。ASK 是向上游发送只读设置，不是外部客户端执行 Shell/文件操作的安全沙箱。
+
+本地运行数据默认位于启动目录：
+
+| 文件 | 用途 |
+| --- | --- |
+| `config.yaml` | 本机配置、API Key、管理密码哈希等 |
+| `accounts/*.json` | 账号凭据、用户/工作区及缓存额度 |
+| `accounts/.routing.json` | 调度策略和手动暂停成员 |
+| `accounts/.request_logs.sqlite` | 新请求日志与尝试轨迹，运行时可能有 WAL/SHM 文件 |
+| `accounts/.token_stats.json` | 原有历史 Token 汇总 |
+
+这些运行数据不应进入公开仓库。新增结构化日志不保存完整提示词、回答、工具参数或 Cookie；**这不代表旧调试日志同样不含敏感内容**，调试/原始输入输出开关应按需开启，分享前必须检查。首次生成的明文管理密码也可能出现在启动输出中。
+
+升级前应停止服务并备份配置、账号及日志数据库。SQLite 使用 WAL 时，不要只复制正在运行的主数据库文件就认为备份一致。回滚二进制时保留新增账号和日志，不用旧账号备份覆盖后来导入的成员。
+
+服务默认仅监听本机。公开的是**源代码仓库**，不是你的本机管理面板；如需远程部署，必须另行设计 HTTPS、访问控制和凭据保护，不建议直接把8081端口暴露到公网。
+
+## 开发与构建
+
+只运行 Go 入口无需重建前端。修改前端后，需要重新构建、同步到 Go embed 目录并重新生成二进制；只执行 Vite 构建不会更新正在运行的服务。
+
+建议使用 Node.js 22.18+ 和 npm 运行前端测试（直接导入 TypeScript），构建示例：
+
+```bash
+npm --prefix web ci
+npm --prefix web run build
+
+# macOS / Linux：同步生成文件，不涉及账号数据
+mkdir -p internal/web/dist
+cp -R web/dist/. internal/web/dist/
+
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o notion-manager ./cmd/notion-manager
+```
+
+Windows 可分别运行上述 npm 和 Go 命令，再用文件管理器复制 `web/dist/` 内容到 `internal/web/dist/`。现有 Makefile 含 Windows 命令，不作为跨平台构建脚本承诺。SQLite 使用纯 Go 驱动，无需额外启动数据库。
+
+测试：
+
+```bash
+go test ./...
+go test -race ./internal/proxy ./cmd/notion-manager
+go vet ./...
+node --test web/src/*.test.mjs chrome-extension/*.test.cjs
+```
+
+race 检测需要支持的平台及相应原生工具链；发布二进制使用的 `CGO_ENABLED=0` 与 race 测试不是同一种构建。
+
+### 验证范围与已知限制
+
+2026-10-18 升级时，通过了 Go 单元/协议/race 测试、前端/扩展测试、前端构建和五平台 `CGO_ENABLED=0` 交叉编译；本机 macOS 实际浏览器走查了六页主流程，并对三种协议各完成一次真实连通检查。
+
+- 自动化覆盖 1/2/5/8 成员池、并发、动态成员、安全切号、取消和日志恢复；这不是用真实账号烧尽额度的演练。
+- 未承诺所有模型、客户端、长会话、工具链及 Linux/Windows 实际运行都已完整验收；交叉编译成功不等于异平台业务运行通过。
+- `/v1/responses` 是兼容桥接，暂不支持 `previous_response_id`；不是官方 OpenAI/Anthropic API 的完整替代。
+- 工具、文件输入、研究模式及 Claude Code 适配沿用原引擎，受其转换规则和 Notion 能力约束；不会因增加管理页面就获得完整 MCP/Agent 能力。
+- Notion 的非公开接口、认证条件和套餐规则可能改变；模型可见、余额有余量或浏览器已登录，都不保证池内旧凭据仍有效。
+- 本分支没有自动购买套餐、自动注册补号、云端多租户或计费能力；也未发布包含本次升级的新二进制 Release。
+
+## 项目结构与进一步阅读
+
+- `cmd/notion-manager/`：Go 服务入口。
+- `internal/proxy/`：协议转换、账号池、额度、日志与分析。
+- `web/`：React 管理前端；`internal/web/dist/` 为内嵌构建产物。
+- `chrome-extension/`：账号/工作区读取、直接导入和 JSON 备用导出。
+- [来源与许可证说明](docs/UPSTREAM-NOTICE.md)。
+- [配置参考](docs/configuration_cn.md)、[协议参考](docs/api_cn.md)、[Claude Code 桥接说明](docs/claude-code-integration.md)。
+
+部分深层说明沿用上游，可能包含旧注册流程或旧默认值；**当前分支的新增规则、默认端口和管理功能以本文及实际代码为准**。旧注册代码保留不表示提供绕过 Business 门槛的入口。
