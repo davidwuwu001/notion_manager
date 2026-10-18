@@ -25,6 +25,12 @@
   </p>
 </div>
 
+## Origin and this modified version
+
+This repository is a modified version of [SleepingBag945/notion_manager](https://github.com/SleepingBag945/notion_manager). Credit for the original project belongs to **SleepingBag945 and the upstream contributors**; their commit history and [CC BY-NC-SA 4.0 license](LICENSE) are preserved.
+
+This version adds a six-page dashboard, persistent request logs and analytics, dynamic account-pool routing, verified Business-workspace imports, and quota/authentication fixes. New accounts must be verified non-trial Business workspaces; legacy registration tasks are read-only, so the upstream bulk-registration instructions below do not apply to this version. See [upstream attribution](docs/UPSTREAM-NOTICE.md) for the separate dashboard inspiration and license notes. This is not an official Notion project or an endorsement by the original author.
+
 ---
 
 <p align="center">

@@ -25,6 +25,12 @@
   </p>
 </div>
 
+## 项目来源与本仓库说明
+
+本仓库基于 [SleepingBag945/notion_manager](https://github.com/SleepingBag945/notion_manager) 二次开发。**原项目作者为 SleepingBag945 及上游贡献者**，本仓库保留原提交历史和 [CC BY-NC-SA 4.0 许可证](LICENSE)，不将上游成果冒称为本仓库原创。
+
+本版本新增六页管理后台、持久化请求日志与数据分析、动态账号池调度、正式 Business 工作区导入，以及额度/认证处理修正。新增账号须核验为非试用 Business，旧注册任务仅保留只读历史，因此下文沿用的上游批量注册说明不适用于本版本。管理功能的另一参考项目及许可说明见[来源声明](docs/UPSTREAM-NOTICE.md)。本仓库不是 Notion 官方项目，也不表示获得原作者背书。
+
 ---
 
 <p align="center">
