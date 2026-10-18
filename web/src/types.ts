@@ -40,6 +40,13 @@ export interface AccountInfo {
   premium_balance?: number
   premium_usage?: number
   premium_limit?: number
+  rate_limit?: {
+    status: string
+    window: { used: number; limit: number; window: string }
+    rolling_reset_at_ms: number
+    billingPeriodWindow: { used: number; limit: number; periodEndMs: number }
+  }
+  rate_limit_error?: string
   token_v2?: string
   registered_via?: string
 }

@@ -332,7 +332,7 @@ func main() {
 	mux := newMux(pool, accountsDir, apiKey, dashAuth, usageStats, regDeps)
 
 	log.Printf("=== notion-manager ===")
-	log.Printf("Listening on :%s", port)
+	log.Printf("Listening on 127.0.0.1:%s", port)
 	log.Printf("Accounts: %d", pool.Count())
 	log.Printf("API Key: %s", apiKey)
 	log.Printf("Dashboard: password protected")
@@ -354,7 +354,7 @@ func main() {
 	log.Printf("  GET  /admin/register/jobs/{id}/events (SSE progress)")
 	log.Printf("  GET  /ai                          (Reverse Proxy -> notion.so)")
 
-	if err := http.ListenAndServe(":"+port, cors(apiKeyAuthMiddleware(apiKey, mux))); err != nil {
+	if err := http.ListenAndServe("127.0.0.1:"+port, cors(apiKeyAuthMiddleware(apiKey, mux))); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
 }

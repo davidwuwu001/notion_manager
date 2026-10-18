@@ -48,12 +48,14 @@ type Account struct {
 
 // QuotaInfo holds AI usage quota information from V1 + V2 APIs
 type QuotaInfo struct {
-	IsEligible    bool  `json:"isEligible"`
-	SpaceUsage    int   `json:"spaceUsage"`
-	SpaceLimit    int   `json:"spaceLimit"`
-	UserUsage     int   `json:"userUsage"`
-	UserLimit     int   `json:"userLimit"`
-	LastUsageAtMs int64 `json:"lastSpaceUsageAtMs"`
+	RateLimit      *CreditRateLimit `json:"rate_limit,omitempty"`
+	RateLimitError string           `json:"rate_limit_error,omitempty"`
+	IsEligible     bool             `json:"isEligible"`
+	SpaceUsage     int              `json:"spaceUsage"`
+	SpaceLimit     int              `json:"spaceLimit"`
+	UserUsage      int              `json:"userUsage"`
+	UserLimit      int              `json:"userLimit"`
+	LastUsageAtMs  int64            `json:"lastSpaceUsageAtMs"`
 	// Research mode (from V1 API: getAIUsageEligibility)
 	ResearchModeUsage int `json:"researchModeUsage"` // usage when "Share data to improve AI" is enabled
 	// Premium credits (from V2 API: getAIUsageEligibilityV2)
@@ -61,6 +63,23 @@ type QuotaInfo struct {
 	PremiumBalance int  `json:"premiumBalance"` // remaining premium credits
 	PremiumUsage   int  `json:"premiumUsage"`   // used premium credits (monthlyAllocated)
 	PremiumLimit   int  `json:"premiumLimit"`   // total premium credit limit
+}
+
+// CreditRateLimit is the allowance shown in Notion's AI Usage settings, separate from premium credits.
+type CreditRateLimit struct {
+	Status string `json:"status"`
+	Window struct {
+		Used   float64 `json:"used"`
+		Limit  float64 `json:"limit"`
+		Window string  `json:"window"`
+	} `json:"window"`
+	ResetsInSeconds     int64 `json:"resetsInSeconds"`
+	RollingResetAtMs    int64 `json:"rolling_reset_at_ms"`
+	BillingPeriodWindow struct {
+		Used        float64 `json:"used"`
+		Limit       float64 `json:"limit"`
+		PeriodEndMs int64   `json:"periodEndMs"`
+	} `json:"billingPeriodWindow"`
 }
 
 // quotaV1Response is the raw response from getAIUsageEligibility

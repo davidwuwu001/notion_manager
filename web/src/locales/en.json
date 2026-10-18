@@ -1,4 +1,14 @@
 {
+  "ai_usage": {
+    "title": "Notion AI plan usage",
+    "rolling": "Rolling ({{window}})",
+    "monthly": "Monthly",
+    "used": "{{percent}}% used",
+    "resets": "Resets at {{date}}",
+    "reset_unknown": "Reset time not provided",
+    "unavailable": "Plan usage unavailable. Refresh quota to retry.",
+    "note": "Plan usage and Premium credits are separate. Values reflect the last quota refresh."
+  },
   "auth": {
     "prompt": "Enter admin key to access Dashboard",
     "placeholder": "Admin Key",
@@ -19,7 +29,7 @@
     "used": "Used {{count}}",
     "no_workspace": "No Workspace",
     "basic_remaining": "Basic Remaining",
-    "premium_remaining": "Premium Remaining",
+    "premium_remaining": "Premium Credits Remaining",
     "last_checked": "Checked {{date}}",
     "recent_ai": "Recent AI {{date}}",
     "unavailable": "Unavailable ⚠",
@@ -30,7 +40,7 @@
     "total_accounts": "Total Accounts",
     "available": "Available",
     "basic_remaining": "Basic Remaining",
-    "premium_remaining": "Premium Remaining",
+    "premium_remaining": "Premium Credits Remaining",
     "token_usage": "Token Usage",
     "available_spent_no_workspace": "{{available}} Available / {{spent}} Spent / {{noWorkspace}} No Workspace",
     "ratio": "Ratio {{percent}}%",

@@ -1930,8 +1930,44 @@ func CheckQuota(acc *Account) (*QuotaInfo, error) {
 		v2.PremiumCredits.PerSource.MonthlyCommitted.Limit > 0 ||
 		v2.PremiumCredits.PerSource.YearlyElastic.Limit > 0 ||
 		info.PremiumBalance > 0
+	info.RateLimit, err = checkCreditRateLimit(acc, client)
+	if err != nil {
+		info.RateLimitError = "AI usage unavailable"
+		log.Printf("[quota] credit rate limit unavailable: %v", err)
+	}
 
 	return info, nil
+}
+
+func checkCreditRateLimit(acc *Account, client *http.Client) (*CreditRateLimit, error) {
+	body, err := json.Marshal(map[string]string{"spaceId": acc.SpaceID})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("POST", NotionAPIBase+"/getCreditRateLimitStatus", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	setNotionHeadersJSON(req, acc)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("credit rate limit HTTP %d", resp.StatusCode)
+	}
+	var result CreditRateLimit
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	if result.Window.Limit <= 0 && result.BillingPeriodWindow.Limit <= 0 {
+		return nil, fmt.Errorf("credit rate limit response has no exposed allowances")
+	}
+	if result.ResetsInSeconds > 0 {
+		result.RollingResetAtMs = time.Now().UnixMilli() + result.ResetsInSeconds*1000
+	}
+	return &result, nil
 }
 
 // CheckUserWorkspace probes /api/v3/loadUserContent and returns the number

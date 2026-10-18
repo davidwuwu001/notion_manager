@@ -409,6 +409,32 @@ function TotalQuotaBar({ summary }: { summary?: AccountSummary | null }) {
   )
 }
 
+function AIUsage({ account }: { account: AccountInfo }) {
+  const { t } = useTranslation()
+  const rate = account.rate_limit
+  const windows = rate ? [
+    { label: t('ai_usage.rolling', { window: rate.window.window }), used: rate.window.used, limit: rate.window.limit, reset: rate.rolling_reset_at_ms },
+    { label: t('ai_usage.monthly'), used: rate.billingPeriodWindow.used, limit: rate.billingPeriodWindow.limit, reset: rate.billingPeriodWindow.periodEndMs },
+  ] : []
+  return (
+    <section className="my-3 rounded-md border border-border bg-bg-card p-3" aria-label={t('ai_usage.title')}>
+      <div className="text-[12px] font-semibold mb-2">{t('ai_usage.title')}</div>
+      {!rate && <p className="text-[11px] text-text-secondary">{t('ai_usage.unavailable')}</p>}
+      {windows.map(w => w.limit > 0 ? (
+        <div key={w.label} className="mb-2 text-[11px]">
+          <div className="flex flex-wrap justify-between gap-2">
+            <span>{w.label} · {t('ai_usage.used', { percent: Math.round(w.used / w.limit * 100) })}</span>
+            <span className="text-text-secondary">{w.reset > 0 ? t('ai_usage.resets', { date: new Date(w.reset).toLocaleString() }) : t('ai_usage.reset_unknown')}</span>
+          </div>
+          <progress aria-label={w.label} max={w.limit} value={Math.max(0, Math.min(w.used, w.limit))} className="w-full h-1.5 accent-[#2383e2]" />
+          <div className="text-text-muted tabular-nums">{w.used} / {w.limit}</div>
+        </div>
+      ) : <p key={w.label} className="text-text-secondary text-[11px]">{w.label} · {t('ai_usage.unavailable')}</p>)}
+      <p className="text-[10px] text-text-muted">{t('ai_usage.note')}</p>
+    </section>
+  )
+}
+
 function QuotaBar({ label, labelClass, usage, limit, status }: { label: string; labelClass?: string; usage?: number; limit?: number; status?: 'ok' | 'low' | 'exhausted' }) {
   const pct = getQuotaPct(usage, limit)
   const resolvedStatus = status || getQuotaStatusByUsage(usage, limit)
@@ -539,6 +565,7 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
       </div>
 
       {/* Quotas */}
+      <AIUsage account={account} />
       {sameBasicQuota ? (
         <QuotaBar label="Basic" usage={spaceQuota.usage} limit={spaceQuota.limit} />
       ) : (
@@ -868,6 +895,7 @@ export default function App() {
 
         {/* Total Quota Bar */}
         <TotalQuotaBar summary={data?.summary} />
+        {data?.accounts.length === 1 && <AIUsage account={data.accounts[0]} />}
 
         {/* Refresh Status Banner */}
         {refreshStatus?.refreshing && (

@@ -1,4 +1,14 @@
 {
+  "ai_usage": {
+    "title": "Notion AI 套餐用量",
+    "rolling": "滚动周期（{{window}}）",
+    "monthly": "月度",
+    "used": "已使用 {{percent}}%",
+    "resets": "重置于 {{date}}",
+    "reset_unknown": "重置时间未提供",
+    "unavailable": "暂未获取套餐用量，请刷新配额重试",
+    "note": "套餐用量与 Premium 积分分开计量；以最近一次配额刷新为准。"
+  },
   "auth": {
     "prompt": "输入管理密钥以访问 Dashboard",
     "placeholder": "管理密钥",
@@ -19,7 +29,7 @@
     "used": "已用 {{count}}",
     "no_workspace": "无工作区",
     "basic_remaining": "Basic 剩余",
-    "premium_remaining": "Premium 剩余",
+    "premium_remaining": "Premium 积分剩余",
     "last_checked": "检查 {{date}}",
     "recent_ai": "最近 AI {{date}}",
     "unavailable": "不可用 ⚠",
@@ -30,7 +40,7 @@
     "total_accounts": "总账号",
     "available": "可用",
     "basic_remaining": "Basic 剩余",
-    "premium_remaining": "Premium 剩余",
+    "premium_remaining": "Premium 积分剩余",
     "token_usage": "Token 用量",
     "available_spent_no_workspace": "{{available}} 可用 / {{spent}} 耗尽 / {{noWorkspace}} 无工作区",
     "ratio": "占比 {{percent}}%",
