@@ -1,4 +1,26 @@
 {
+  "models": {
+    "navigation": "Dashboard navigation",
+    "tab_accounts": "Accounts & usage",
+    "tab_models": "Models & API",
+    "connections": "API connection addresses",
+    "address_note": "Use Base URL in clients and the full endpoint for direct requests. OpenAI Base URLs already include /v1; do not append it twice.",
+    "base": "Client Base URL",
+    "endpoint": "Full request endpoint",
+    "method": "Method",
+    "copy": "Copy address",
+    "copy_id": "Copy ID",
+    "copy_failed": "Copy failed. Select the address or model ID to copy manually and check clipboard permissions.",
+    "copied_value": "Copied: {{value}}",
+    "auth_note": "Use the API Key on Accounts & usage. OpenAI: Authorization: Bearer <API_KEY>; Anthropic: x-api-key: <API_KEY>, anthropic-version: 2023-06-01.",
+    "list": "Discovered models",
+    "reload": "Reload models",
+    "source_note": "From GET /v1/models. Copy an ID into the request's model field. Calls depend on account permissions, quota and upstream availability. Refresh quota on Accounts & usage to update the upstream model cache.",
+    "loading": "Loading models…",
+    "load_failed": "Failed to load models: {{error}}",
+    "invalid_response": "Invalid model list response",
+    "empty": "No models found. Add an available account and refresh quota."
+  },
   "ai_usage": {
     "title": "Notion AI plan usage",
     "rolling": "Rolling ({{window}})",

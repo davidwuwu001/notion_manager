@@ -8,6 +8,7 @@ import { AccountMenu } from './components/AccountMenu'
 import { RegisterModal } from './components/RegisterModal'
 import { HistoryDrawer } from './components/HistoryDrawer'
 import { LanguageToggle } from './components/LanguageToggle'
+import { ModelsPanel } from './components/ModelsPanel'
 import { IconUserPlus, IconHistory } from './components/Icons'
 
 // --- Icons ---
@@ -627,6 +628,7 @@ export default function App() {
   const [historyOpen, setHistoryOpen] = useState(false)
   const [copiedField, setCopiedField] = useState<'key' | 'base' | null>(null)
   const [showAddModal, setShowAddModal] = useState(false)
+  const [activeTab, setActiveTab] = useState<'accounts' | 'models'>('accounts')
   const copyToClipboard = (text: string, field: 'key' | 'base') => {
     navigator.clipboard.writeText(text)
     setCopiedField(field)
@@ -854,6 +856,25 @@ export default function App() {
       <Header query={query} onQuery={setQuery} onLogout={handleLogout} authRequired={authRequired} />
 
       <main className="max-w-[1280px] mx-auto px-6 py-6">
+        <div role="tablist" aria-label={t('models.navigation')} className="flex gap-2 border-b border-border pb-3 mb-5">
+          {(['accounts', 'models'] as const).map(tab => (
+            <button key={tab} id={`tab-${tab}`} role="tab" aria-selected={activeTab === tab} aria-controls={`panel-${tab}`} tabIndex={activeTab === tab ? 0 : -1}
+              onClick={() => setActiveTab(tab)}
+              onKeyDown={event => {
+                if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+                  event.preventDefault()
+                  const next = event.key === 'Home' ? 'accounts' : event.key === 'End' ? 'models' : tab === 'accounts' ? 'models' : 'accounts'
+                  setActiveTab(next)
+                  document.getElementById(`tab-${next}`)?.focus()
+                }
+              }}
+              className={`rounded-md px-4 py-2 text-[13px] border border-border cursor-pointer ${activeTab === tab ? 'bg-notion-blue text-white' : 'bg-bg-card text-text-secondary hover:bg-bg-card-hover'}`}>
+              {t(`models.tab_${tab}`)}
+            </button>
+          ))}
+        </div>
+        {activeTab === 'models' && <div role="tabpanel" id="panel-models" aria-labelledby="tab-models"><ModelsPanel /></div>}
+        <div role="tabpanel" id="panel-accounts" aria-labelledby="tab-accounts" hidden={activeTab !== 'accounts'}>
         {/* Summary */}
         {summary && (
           <div className="grid grid-cols-5 divide-x divide-white/[.05] mb-6 max-lg:grid-cols-3 max-md:grid-cols-2 max-md:divide-x-0 max-sm:grid-cols-1">
@@ -1139,6 +1160,7 @@ export default function App() {
             </button>
           </div>
         )}
+        </div>
       </main>
       {showAddModal && <AddAccountModal onClose={() => setShowAddModal(false)} onSuccess={loadData} />}
 
