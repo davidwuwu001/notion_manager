@@ -102,7 +102,7 @@ async function extract() {
           // Call loadUserContent
           const userResp = await fetch('/api/v3/loadUserContent', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', 'x-notion-active-user-header': activeUserId },
             credentials: 'include',
             body: '{}'
           });
@@ -161,7 +161,7 @@ async function extract() {
           // Get available models
           const modelResp = await fetch('/api/v3/getAvailableModels', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', 'x-notion-active-user-header': activeUserId },
             credentials: 'include',
             body: JSON.stringify({ spaceId: bestSpace.id })
           });

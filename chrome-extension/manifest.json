@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Notion Manager 账号导入助手",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "Extract Notion AI account config (token_v2, userId, spaceId) / 一键提取 Notion AI 账号配置",
   "permissions": [
     "cookies",

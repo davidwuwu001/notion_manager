@@ -63,7 +63,7 @@ test('copy works without opening sensitive JSON and reports clipboard errors', a
   assert.match(env.document.getElementById('copyBtn').textContent, /复制失败/);
 });
 
-test('reads live billing per workspace instead of trusting legacy team labels', async () => {
+test('reads the selected login identity and its billing even when Notion defaults to another user', async () => {
   const env = environment();
   Object.assign(env.context, {
     readCurrentNotionSession: async () => ({ tab: { id: 1, url: 'https://app.notion.com' }, token: 'fixture', userId: 'u' }),
@@ -72,7 +72,7 @@ test('reads live billing per workspace instead of trusting legacy team labels', 
     chrome: { cookies: { getAll: async () => [] }, scripting: { executeScript: async ({ func, args }) => [{ result: await func(...args) }] } },
     fetch: async (url, options) => ({ ok: true, json: async () => {
       if (url.endsWith('loadUserContent')) return { recordMap: {
-        notion_user: { u: { value: { name: 'User' } } },
+        notion_user: { [options.headers['x-notion-active-user-header'] === 'u' ? 'u' : 'other-user']: { value: { name: 'User' } } },
         user_root: { u: { value: { space_view_pointers: ['paid','trial','free','unknown'].map(spaceId => ({ spaceId })) } } },
         space: Object.fromEntries(['paid','trial','free','unknown'].map(id => [id, { value: { id, name: 'Same Name', plan_type: 'team' } }])),
       } };
@@ -84,7 +84,7 @@ test('reads live billing per workspace instead of trusting legacy team labels', 
           ...(spaceId !== 'free' ? { subscription: { items: [{ price: { product: 'business' } }] } } : {}),
         } };
       }
-      return { models: [] };
+      return { models: options.headers['x-notion-active-user-header'] === 'u' ? [{ model: 'current-user-model', modelMessage: 'Current model' }] : [] };
     } }),
   });
   await vm.runInContext('extract()', env.context);
@@ -92,4 +92,20 @@ test('reads live billing per workspace instead of trusting legacy team labels', 
   assert.deepEqual(Array.from(workspaces, w => w.business_verified), [true, false, false, false]);
   assert.equal(env.document.getElementById('workspaceSelect').value, 'paid');
   assert.equal(JSON.parse(env.document.getElementById('configJson').value).plan_type, 'business');
+  assert.equal(vm.runInContext('extractedConfig.available_models[0]?.id', env.context), 'current-user-model');
+});
+
+test('a mismatched API identity is still rejected instead of picking the first returned user', async () => {
+  const env = environment();
+  Object.assign(env.context, {
+    readCurrentNotionSession: async () => ({ tab: { id: 1 }, token: 'fixture', userId: 'current-user' }),
+    crypto: { randomUUID: () => 'fixture' },
+    chrome: { cookies: { getAll: async () => [] }, scripting: { executeScript: async ({ func, args }) => [{ result: await func(...args) }] } },
+    fetch: async () => ({ ok: true, json: async () => ({ recordMap: { notion_user: { 'other-user': { value: { name: 'Other user' } } } } }) }),
+  });
+  await vm.runInContext('extract()', env.context);
+  assert.equal(env.elements.get('status').className, 'status error');
+  assert.match(env.elements.get('status').textContent, /用户不匹配/);
+  assert.equal(env.elements.get('importBtn').disabled, true);
+  assert.equal(vm.runInContext('extractedConfig', env.context), null);
 });
