@@ -10,6 +10,11 @@ export function quotaRefreshProgress(pending: boolean, refreshing: boolean | und
   return { pending: refreshing ?? pending, completed: pending && refreshing === false }
 }
 
+export function quotaErrorKey(error: string | undefined): string {
+  const known = ['authentication_failed', 'permission_denied', 'rate_limited', 'upstream_error', 'timeout', 'network_error', 'invalid_response']
+  return error && known.includes(error) ? `quota.error_${error}` : 'quota.error_unavailable'
+}
+
 export function routingMetrics(routing: { total: number; available: number; exhausted: number } | null | undefined, exhaustedOnly?: number) {
   return {
     available: routing?.available ?? null,

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -1905,6 +1906,48 @@ func CheckQuota(acc *Account) (*QuotaInfo, error) {
 	return checkQuotaWithClient(acc, getChromeHTTPClient(AppConfig.APITimeoutDuration()))
 }
 
+type quotaReadError string
+
+func (e quotaReadError) Error() string { return string(e) }
+
+func quotaHTTPError(status int) error {
+	switch status {
+	case http.StatusUnauthorized:
+		return quotaReadError("authentication_failed")
+	case http.StatusForbidden:
+		return quotaReadError("permission_denied")
+	case http.StatusTooManyRequests:
+		return quotaReadError("rate_limited")
+	default:
+		return quotaReadError("upstream_error")
+	}
+}
+
+// Only safe categories cross the quota API boundary, never raw transport errors or bodies.
+func quotaErrorCode(err error) string {
+	var classified quotaReadError
+	if errors.As(err, &classified) {
+		return string(classified)
+	}
+	var timeout net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &timeout) && timeout.Timeout()) {
+		return "timeout"
+	}
+	var transport *url.Error
+	if errors.As(err, &transport) {
+		return "network_error"
+	}
+	if errors.As(err, &timeout) {
+		return "network_error"
+	}
+	var syntax *json.SyntaxError
+	var invalidType *json.UnmarshalTypeError
+	if errors.As(err, &syntax) || errors.As(err, &invalidType) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "invalid_response"
+	}
+	return "unavailable"
+}
+
 func checkQuotaWithClient(acc *Account, client *http.Client) (*QuotaInfo, error) {
 	var v1 quotaV1Response
 	var v2 quotaV2Response
@@ -1922,7 +1965,7 @@ func checkQuotaWithClient(acc *Account, client *http.Client) (*QuotaInfo, error)
 		defer wg.Done()
 		sourceErrors[1] = fetchQuotaJSON(acc, client, "/getAIUsageEligibilityV2", "premiumCredits", &v2)
 		if sourceErrors[1] == nil && v2.PremiumCredits.TotalCreditBalance == nil {
-			sourceErrors[1] = errors.New("premium balance unavailable")
+			sourceErrors[1] = quotaReadError("invalid_response")
 		}
 		checked[1] = time.Now().UnixMilli()
 	}()
@@ -1939,7 +1982,7 @@ func checkQuotaWithClient(acc *Account, client *http.Client) (*QuotaInfo, error)
 	for i, name := range []string{"basic", "premium", "allowance"} {
 		status := QuotaSourceStatus{CheckedAtMs: checked[i]}
 		if sourceErrors[i] != nil {
-			status.Error = name + " quota unavailable"
+			status.Error = quotaErrorCode(sourceErrors[i])
 		} else {
 			status.SucceededAtMs = checked[i]
 			successes++
@@ -1947,7 +1990,7 @@ func checkQuotaWithClient(acc *Account, client *http.Client) (*QuotaInfo, error)
 		info.Sources[name] = status
 	}
 	if sourceErrors[2] != nil {
-		info.RateLimitError = "AI usage unavailable"
+		info.RateLimitError = quotaErrorCode(sourceErrors[2])
 	}
 	info.QuotaStatusReason = quotaStatusReason(info)
 	if successes == 0 {
@@ -1969,7 +2012,7 @@ func fetchQuotaJSON(acc *Account, client *http.Client, endpoint, required string
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("quota HTTP %d", resp.StatusCode)
+		return quotaHTTPError(resp.StatusCode)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
@@ -1977,12 +2020,15 @@ func fetchQuotaJSON(acc *Account, client *http.Client, endpoint, required string
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil {
-		return err
+		return quotaReadError("invalid_response")
 	}
 	if field := fields[required]; len(field) == 0 || string(field) == "null" {
-		return errors.New("quota field unavailable")
+		return quotaReadError("invalid_response")
 	}
-	return json.Unmarshal(data, value)
+	if err := json.Unmarshal(data, value); err != nil {
+		return quotaReadError("invalid_response")
+	}
+	return nil
 }
 
 func mergeQuotaResponses(v1 quotaV1Response, v2 quotaV2Response) *QuotaInfo {
@@ -2042,14 +2088,14 @@ func checkCreditRateLimit(acc *Account, client *http.Client) (*CreditRateLimit, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("credit rate limit HTTP %d", resp.StatusCode)
+		return nil, quotaHTTPError(resp.StatusCode)
 	}
 	var result CreditRateLimit
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
 	if result.Window.Limit <= 0 && result.BillingPeriodWindow.Limit <= 0 {
-		return nil, fmt.Errorf("credit rate limit response has no exposed allowances")
+		return nil, quotaReadError("invalid_response")
 	}
 	if result.ResetsInSeconds > 0 {
 		result.RollingResetAtMs = time.Now().UnixMilli() + result.ResetsInSeconds*1000

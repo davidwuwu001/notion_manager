@@ -8,7 +8,7 @@ import { LanguageToggle } from './components/LanguageToggle'
 import { ModelsPanel } from './components/ModelsPanel'
 import { parseAccountImport } from './account-import'
 import type { AccountImport } from './account-import'
-import { dashboardTabs, dashboardTab, timestampValue, quotaRefreshProgress, confirmedPremiumBalance, metricValue, routingMetrics } from './dashboard'
+import { dashboardTabs, dashboardTab, timestampValue, quotaRefreshProgress, confirmedPremiumBalance, metricValue, routingMetrics, quotaErrorKey } from './dashboard'
 import type { DashboardTab } from './dashboard'
 import { OverviewPanel } from './components/OverviewPanel'
 import { LogsPanel } from './components/LogsPanel'
@@ -482,11 +482,11 @@ function AIUsage({ account }: { account: AccountInfo }) {
           if (!state) return null
           return <div key={source}>
             {t(`quota.source_${source}`)} · {t('quota.last_success', { time: timestampValue(state.succeeded_at_ms) })}
-            {state.error && <p role="status" className="text-warn">{t('quota.source_failed', { time: timestampValue(state.checked_at_ms) })}</p>}
+            {state.error && <p role="status" className="text-warn">{t('quota.source_failed', { time: timestampValue(state.checked_at_ms), reason: t(quotaErrorKey(state.error)) })}</p>}
           </div>
         })}
       </div>}
-      {account.rate_limit_error && <p role="status" className="text-[11px] text-warn mb-2">{t('quota.rate_read_failed')}</p>}
+      {account.rate_limit_error && <p role="status" className="text-[11px] text-warn mb-2">{t('quota.rate_read_failed', { reason: t(quotaErrorKey(account.rate_limit_error)) })}</p>}
       {!rate && <p className="text-[11px] text-text-secondary">{t('ai_usage.unavailable')}</p>}
       {windows.map(w => w.limit > 0 ? (
         <div key={w.label} className="mb-2 text-[11px]">

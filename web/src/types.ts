@@ -317,3 +317,34 @@ export interface RoutingData extends RoutingConfig {
   busy: number
   accounts: RoutingMember[]
 }
+
+export interface SystemStatus {
+  status: string
+  uptime_seconds: number
+  pid: number
+  go_version: string
+  memory_bytes: number
+  listen_addr: string
+  pool: {
+    total: number
+    available: number
+    paused: number
+    exhausted: number
+    cooldown: number
+    invalid: number
+    busy: number
+    last_quota_checked_ms: number
+  }
+  storage: {
+    status: string
+    data_complete: boolean
+    retention_days: number
+    captured_since_ms: number
+  }
+  launch_agent: {
+    managed: boolean
+    label?: string
+    state?: string
+    last_exit_code?: number
+  }
+}

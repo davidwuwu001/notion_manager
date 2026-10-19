@@ -3,11 +3,14 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -62,6 +65,75 @@ func TestQuotaSourceFailureStillQueriesOtherEndpoints(t *testing.T) {
 	}
 	if !info.PremiumBalanceKnown || info.PremiumBalance != 0 || info.RateLimit == nil {
 		t.Fatalf("other sources were discarded: %+v", info)
+	}
+}
+
+func TestQuotaFailuresExposeSafeActionableReasons(t *testing.T) {
+	previousConfig, previousBase := AppConfig, NotionAPIBase
+	AppConfig = DefaultConfig()
+	t.Cleanup(func() { AppConfig, NotionAPIBase = previousConfig, previousBase })
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{"authentication", 401, `{"message":"secret-token-do-not-expose"}`, "authentication_failed"},
+		{"permission", 403, `secret-token-do-not-expose`, "permission_denied"},
+		{"rate limit", 429, `secret-token-do-not-expose`, "rate_limited"},
+		{"upstream", 503, `secret-token-do-not-expose`, "upstream_error"},
+		{"invalid JSON", 200, `secret-token-do-not-expose`, "invalid_response"},
+		{"missing fields", 200, `{}`, "invalid_response"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				fmt.Fprint(w, tc.body)
+			}))
+			defer server.Close()
+			NotionAPIBase = server.URL
+			info, err := checkQuotaWithClient(&Account{}, server.Client())
+			if err == nil {
+				t.Fatal("all-source failure was accepted")
+			}
+			for source, status := range info.Sources {
+				if status.Error != tc.want || status.SucceededAtMs != 0 {
+					t.Fatalf("%s: want safe reason %q, got %+v", source, tc.want, status)
+				}
+			}
+			if info.RateLimitError != tc.want {
+				t.Fatalf("allowance reason lost: %q", info.RateLimitError)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+		body bool
+	}{
+		{"timeout", context.DeadlineExceeded, "timeout", false},
+		{"network", fmt.Errorf("secret-token-do-not-expose"), "network_error", false},
+		{"body timeout", context.DeadlineExceeded, "timeout", true},
+		{"body network", &net.OpError{Op: "read", Err: fmt.Errorf("secret-token-do-not-expose")}, "network_error", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &http.Client{Transport: accountDiscoveryRoundTripper(func(*http.Request) (*http.Response, error) {
+				if tc.body {
+					return &http.Response{StatusCode: 200, Body: io.NopCloser(iotest.ErrReader(tc.err))}, nil
+				}
+				return nil, tc.err
+			})}
+			info, err := checkQuotaWithClient(&Account{}, client)
+			if err == nil {
+				t.Fatal("transport failure was accepted")
+			}
+			for source, status := range info.Sources {
+				if status.Error != tc.want {
+					t.Fatalf("%s: want %s, got %q", source, tc.want, status.Error)
+				}
+			}
+		})
 	}
 }
 

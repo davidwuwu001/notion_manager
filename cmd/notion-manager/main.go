@@ -221,6 +221,7 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	mux.HandleFunc("/admin/request-logs", proxy.HandleRequestLogs(requestLogs, dashAuth))
 	mux.HandleFunc("/admin/request-logs/", proxy.HandleRequestLogDetail(requestLogs, dashAuth))
 	mux.HandleFunc("/admin/analytics", proxy.HandleAnalytics(requestLogs, dashAuth))
+	mux.HandleFunc("/admin/system", proxy.HandleSystemStatus(pool, requestLogs, dashAuth))
 	routingHandler := proxy.HandleAdminRouting(pool, dashAuth)
 	mux.HandleFunc("/admin/routing", func(w http.ResponseWriter, r *http.Request) {
 		routingHandler(w, r)

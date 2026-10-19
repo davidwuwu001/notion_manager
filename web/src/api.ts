@@ -1,4 +1,4 @@
-import type { DashboardData, JobStartResponse, ProviderInfo, RegisterJob, TokenStats, RequestAnalytics, RequestLogList, RequestLogDetail, RoutingConfig, RoutingData, Model } from './types'
+import type { DashboardData, JobStartResponse, ProviderInfo, RegisterJob, TokenStats, RequestAnalytics, RequestLogList, RequestLogDetail, RoutingConfig, RoutingData, Model, SystemStatus } from './types'
 import { filterParams } from './dashboard.ts'
 import type { LogFilters } from './dashboard'
 
@@ -20,6 +20,10 @@ export function fetchConnection(signal?: AbortSignal): Promise<{ api_key: string
 
 export function fetchRouting(signal?: AbortSignal): Promise<RoutingData> {
   return adminRequest('/admin/routing', { signal })
+}
+
+export function fetchSystemStatus(signal?: AbortSignal): Promise<SystemStatus> {
+  return adminRequest('/admin/system', { signal })
 }
 
 export function updateRouting(config: RoutingConfig): Promise<RoutingData> {

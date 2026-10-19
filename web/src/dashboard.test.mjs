@@ -1,6 +1,16 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import * as dashboard from './dashboard.ts'
 import { dashboardTab, filterParams, emptyLogFilters, metricValue, quotaRefreshProgress, confirmedPremiumBalance, routingMetrics } from './dashboard.ts'
+
+test('quota failure translation uses only known reasons and hides legacy or raw errors', () => {
+  for (const code of ['authentication_failed', 'permission_denied', 'rate_limited', 'upstream_error', 'timeout', 'network_error', 'invalid_response']) {
+    assert.equal(dashboard.quotaErrorKey?.(code), `quota.error_${code}`)
+  }
+  for (const error of ['basic quota unavailable', 'AI usage unavailable', 'secret-cookie', '__proto__', '', undefined]) {
+    assert.equal(dashboard.quotaErrorKey?.(error), 'quota.error_unavailable')
+  }
+})
 
 test('hash navigation defaults to the compatible accounts page', () => {
   assert.equal(dashboardTab(''), 'accounts')
