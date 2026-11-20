@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-var unenforcedParameters = []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "temperature", "top_p", "top_k", "stop", "stop_sequences", "seed", "presence_penalty", "frequency_penalty", "parallel_tool_calls"}
+var unenforcedParameters = []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "temperature", "top_p", "top_k", "stop", "stop_sequences", "seed", "presence_penalty", "frequency_penalty"}
 
 func setBridgeCompatibilityHeaders(w http.ResponseWriter, body []byte) {
 	w.Header().Set("X-Notion-Capabilities", "/v1/capabilities")
@@ -36,7 +36,7 @@ func HandleCapabilities(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"object": "proxy.capabilities", "protocols": []string{"anthropic_messages", "openai_chat", "openai_responses"},
 		"accepted_but_not_enforced": unenforcedParameters,
-		"custom_tools":              map[string]interface{}{"mode": "text_bridge", "model_family": "anthropic", "native_protocol": false, "incremental": "thinking and complete direct JSON calls; other formats buffered"},
+		"custom_tools":              map[string]interface{}{"mode": "text_bridge", "model_family": "anthropic", "virtual_models": []string{autoModelID}, "native_protocol": false, "incremental": "tool calls are emitted after complete response validation"},
 		"structured_output":         "prompt_bridge_not_schema_enforced", "previous_response_id": false,
 		"session_identity": "metadata.session_id or metadata.conversation_id; user_id JSON with explicit session_id; user/cache keys alone are not conversations",
 		"quota":            "per-workspace polling; source freshness and last-good cache are independent",

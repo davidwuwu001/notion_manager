@@ -92,6 +92,7 @@ type OpenAIChatStreamOptions struct {
 }
 
 type OpenAIChatCompletionRequest struct {
+	ParallelToolCalls   *bool                      `json:"parallel_tool_calls,omitempty"`
 	Model               string                     `json:"model"`
 	Messages            []OpenAIChatMessage        `json:"messages"`
 	PromptCacheKey      string                     `json:"prompt_cache_key,omitempty"`
@@ -135,6 +136,7 @@ type OpenAIReasoningConfig struct {
 }
 
 type OpenAIResponsesRequest struct {
+	ParallelToolCalls  *bool                      `json:"parallel_tool_calls,omitempty"`
 	Model              string                     `json:"model"`
 	Input              interface{}                `json:"input"`
 	PromptCacheKey     string                     `json:"prompt_cache_key,omitempty"`
@@ -1471,7 +1473,7 @@ func convertOpenAIChatCompletionRequest(req *OpenAIChatCompletionRequest) (*Anth
 		Temperature:  req.Temperature,
 		TopP:         req.TopP,
 		Tools:        tools,
-		ToolChoice:   normalizeOpenAIToolChoice(req.ToolChoice, req.FunctionCall),
+		ToolChoice:   openAIToolParallelism(normalizeOpenAIToolChoice(req.ToolChoice, req.FunctionCall), req.ParallelToolCalls),
 		OutputConfig: mergeOpenAIOutputConfigEffort(convertOpenAIResponseFormat(req.ResponseFormat), req.ReasoningEffort),
 		Metadata:     openAIMetadataWithPromptCacheKey(req.Metadata, req.PromptCacheKey),
 	}
@@ -1532,7 +1534,7 @@ func convertOpenAIResponsesRequestWithToolAliases(req *OpenAIResponsesRequest) (
 		Temperature:  req.Temperature,
 		TopP:         req.TopP,
 		Tools:        toolConversion.Tools,
-		ToolChoice:   toolChoice,
+		ToolChoice:   openAIToolParallelism(toolChoice, req.ParallelToolCalls),
 		OutputConfig: mergeOpenAIOutputConfigEffort(convertOpenAIResponsesTextFormat(req.Text), reasoningEffort),
 		Metadata:     openAIMetadataWithPromptCacheKey(req.Metadata, req.PromptCacheKey),
 	}, toolConversion.Aliases, nil
@@ -1818,6 +1820,22 @@ func normalizeOpenAIResponsesToolChoice(toolChoice interface{}, aliases map[stri
 		return map[string]interface{}{"type": "tool", "name": name}, nil
 	}
 	return toolChoice, nil
+}
+
+func openAIToolParallelism(choice interface{}, parallel *bool) interface{} {
+	if parallel == nil || *parallel {
+		return choice
+	}
+	// The Anthropic bridge carries parallelism on the tool_choice object.
+	switch value := choice.(type) {
+	case nil:
+		return map[string]interface{}{"type": "auto", "disable_parallel_tool_use": true}
+	case string:
+		return map[string]interface{}{"type": value, "disable_parallel_tool_use": true}
+	case map[string]interface{}:
+		value["disable_parallel_tool_use"] = true
+	}
+	return choice
 }
 
 func normalizeOpenAIToolChoice(toolChoice interface{}, functionCall interface{}) interface{} {

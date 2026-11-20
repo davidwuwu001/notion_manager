@@ -393,6 +393,9 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 	}
 
 	toolList := buildToolList(tools)
+	if len(toolChoice) > 0 && parallelToolsDisabled(toolChoice[0]) {
+		toolList += "\nIssue at most one tool call in this response. Wait for its result before requesting another tool."
+	}
 
 	// Build tool_call_id → function_name map for resolving tool names
 	toolCallIDMap := make(map[string]string)

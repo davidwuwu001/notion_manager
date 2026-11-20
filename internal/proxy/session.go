@@ -318,8 +318,8 @@ func needsFreshThreadRecovery(messages []ChatMessage) bool {
 // buildFreshThreadRecoveryMessages collapses prior conversation state into a
 // single self-contained user prompt for use when we must recover onto a brand
 // new Notion thread (for example after session loss or account failover).
-func buildRecoveryMessages(messages []ChatMessage, skipEntry func(ChatMessage, string) bool, force bool) []ChatMessage {
-	if !force && !needsFreshThreadRecovery(messages) {
+func buildRecoveryMessages(messages []ChatMessage, skipEntry func(ChatMessage, string) bool) []ChatMessage {
+	if !needsFreshThreadRecovery(messages) {
 		return messages
 	}
 
@@ -447,15 +447,21 @@ func buildRecoveryMessages(messages []ChatMessage, skipEntry func(ChatMessage, s
 }
 
 func buildFreshThreadRecoveryMessages(messages []ChatMessage) []ChatMessage {
-	return buildRecoveryMessages(messages, nil, false)
+	return buildRecoveryMessages(messages, nil)
 }
 
 func buildToolBridgeRecoveryMessages(messages []ChatMessage) []ChatMessage {
 	return buildRecoveryMessages(messages, func(msg ChatMessage, content string) bool {
 		return msg.Role == "assistant" && detectToolBridgeNoToolResponse(content)
-	}, false)
+	})
 }
 
 func buildAgentThreadPromptMessages(messages []ChatMessage) []ChatMessage {
-	return buildRecoveryMessages(messages, nil, true)
+	// Auto starts a fresh Notion thread per request. Keep parallel calls and
+	// results attributable even when a client returns them in a different order.
+	if len(messages) == 0 || (len(messages) == 1 && messages[0].Role == "user") {
+		return messages
+	}
+	history, _ := json.Marshal(messages) // ChatMessage contains only JSON-safe primitives.
+	return []ChatMessage{{Role: "user", Content: "Continue from the final message in this ordered conversation. Match tool_call_id to the corresponding prior call.\n" + string(history)}}
 }

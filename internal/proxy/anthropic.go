@@ -499,6 +499,7 @@ type preparedToolBridgeResponse struct {
 	Remaining      string
 	DoneText       string
 	WebSearchQuery string
+	ToolCallCount  int
 	HasCalls       bool
 }
 
@@ -532,6 +533,7 @@ func prepareToolBridgeResponse(content string, nativeToolUses []AgentValueEntry)
 				realCalls = append(realCalls, tc)
 			}
 		}
+		prepared.ToolCallCount = len(realCalls)
 		prepared.ToolCalls = realCalls
 		prepared.HasCalls = len(prepared.ToolCalls) > 0
 	}
@@ -596,6 +598,15 @@ func toolChoiceIsNone(choice interface{}) bool {
 	return false
 }
 
+func parallelToolsDisabled(choice interface{}) bool {
+	if contract, ok := choice.(toolChoiceContract); ok {
+		choice = contract.choice
+	}
+	object, _ := choice.(map[string]interface{})
+	disabled, _ := object["disable_parallel_tool_use"].(bool)
+	return disabled
+}
+
 func validateToolChoice(choice interface{}, tools []AnthropicTool) error {
 	if choice == nil {
 		return nil
@@ -605,6 +616,11 @@ func validateToolChoice(choice interface{}, tools []AnthropicTool) error {
 	case string:
 		kind = value
 	case map[string]interface{}:
+		if flag, exists := value["disable_parallel_tool_use"]; exists {
+			if _, ok := flag.(bool); !ok {
+				return errors.New("disable_parallel_tool_use must be a boolean")
+			}
+		}
 		kind, _ = value["type"].(string)
 		name, _ = value["name"].(string)
 		if fn, ok := value["function"].(map[string]interface{}); ok && name == "" {
@@ -1153,6 +1169,12 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			probeFromContext(ctx).recordBridgeToolCount(0)
 		}
 
+		// Auto never inherits server-side history. Prepare replay before tool
+		// injection can reduce a continued session to only its latest results.
+		if IsAutoModel(resolvedModel) {
+			messages = buildAgentThreadPromptMessages(messages)
+		}
+
 		// Snapshot the original (pre-injection) messages so failover to a
 		// fresh account can rebuild a self-contained prompt that carries the
 		// full conversation history (the user's "spread the chat to a new
@@ -1532,6 +1554,7 @@ func convertAnthropicMessages(system interface{}, msgs []AnthropicMessage, conte
 					case "tool_result":
 						// Convert tool_result to tool role message
 						toolUseID, _ := m["tool_use_id"].(string)
+						isError, _ := m["is_error"].(bool)
 						var resultText string
 						if c, ok := m["content"].(string); ok {
 							resultText = c
@@ -1548,6 +1571,7 @@ func convertAnthropicMessages(system interface{}, msgs []AnthropicMessage, conte
 							Role:       "tool",
 							Content:    resultText,
 							ToolCallID: toolUseID,
+							IsError:    isError,
 							Name:       toolIDToName[toolUseID],
 						})
 						continue
@@ -1998,6 +2022,9 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 		}
 		prepared = prepareToolBridgeResponse(contentStr, nativeToolUses)
 		declaredOK := declaredToolCalls(prepared, requiredToolAllowed(toolChoice))
+		if len(toolChoice) > 0 && parallelToolsDisabled(toolChoice[0]) && prepared.ToolCallCount > 1 {
+			return ErrToolBridgeNoTool
+		}
 		requiredOK := declaredOK && requiredToolSatisfied(prepared, required, requiredName, requiredToolAllowed(toolChoice))
 		probeFromContext(inferenceContext(w)).recordPrepared(contentStr, nativeToolUses, prepared, declaredOK, requiredOK, required)
 		if !declaredOK {
@@ -2287,6 +2314,9 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 		}
 		prepared = prepareToolBridgeResponse(content, nativeToolUses)
 		declaredOK := declaredToolCalls(prepared, requiredToolAllowed(toolChoice))
+		if len(toolChoice) > 0 && parallelToolsDisabled(toolChoice[0]) && prepared.ToolCallCount > 1 {
+			return ErrToolBridgeNoTool
+		}
 		required, requiredName := requiredToolChoice(toolChoice)
 		requiredOK := declaredOK && requiredToolSatisfied(prepared, required, requiredName, requiredToolAllowed(toolChoice))
 		probeFromContext(inferenceContext(w)).recordPrepared(content, nativeToolUses, prepared, declaredOK, requiredOK, required)
