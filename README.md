@@ -11,7 +11,7 @@
 - 2026-11-20 [R-006 桌面启动入口](PRD.md#r-006-桌面控制台启动模型管理后台)：Notion MCP 控制台新版已签名安装。在「模型管理后台」点击「启动管理后台」后，真实界面自动加载本机后台，健康检查通过。
 - 2026-11-20 [R-007 Notion Auto 模型支持](PRD.md#r-007-notion-auto-模型支持)：OpenAI Chat、OpenAI Responses 和 Anthropic Messages 已支持把 `auto` 作为模型 ID。账号池、额度和精选模型逻辑保持不变，Auto 走独立 Agent Thread 协议，并继续沿用现有工具桥；附件暂不支持并明确报错。已部署到本机 8081，完成真实 `auto` 冒烟和 Claude Code 工具链验收。
 
-- 2026-11-20 [R-008 Agent 工具、多轮及流式兼容](docs/2026-11-20-auto-agent-acceptance.md)：候选版本已通过真实 Codex 与 Claude Code 的失败测试、修改及复测。8081 仍运行 R-007。
+- 2026-11-20 [R-008 Agent 工具、多轮及流式兼容](docs/2026-11-20-auto-agent-acceptance.md)：候选版本已通过真实 Codex 与 Claude Code 的失败测试、修改及复测。已部署至本机 8081，部署后通过真实 Auto Responses 算术问答复核。
 
 R-001 至 R-005 为 2026-11-08 的部署及验证记录，详见[验收记录](docs/2026-11-08-credit-gateway-acceptance.md)和[交接记录](Handoff.md)。
 

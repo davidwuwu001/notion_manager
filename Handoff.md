@@ -2,7 +2,7 @@
 
 ## 正在进行的任务
 
-- 2026-11-20 R-008 的源码和隔离验收已完成，详见[双客户端验收](docs/2026-11-20-auto-agent-acceptance.md)。常用服务仍为 R-007。
+- 2026-11-20 R-008 的源码和隔离验收已完成，详见[双客户端验收](docs/2026-11-20-auto-agent-acceptance.md)。本机 8081 已更新至 `05c7724`，启动方式沿用已有 launchctl 任务。
 
 - 2026-11-20 Notion Auto 模型支持：OpenAI Chat、OpenAI Responses 和 Anthropic Messages 已支持 `auto` 作为虚拟模型 ID，路由层保留账号池、额度、分组和精选模型逻辑。Auto 走 `createAgentThread` + `listenToThreadTranscript`，请求体省略上游 `model` 字段，输出进入现有转码与工具桥，附件请求明确拒绝。Go 全量测试、vet 和隔离 HTTP 回归通过，含三协议入口、工具桥注入和流解析。已部署本机 8081，运行二进制 SHA256 `52ad99ce4b81a26a686f61205c80df14859788a752cc2d30d9f0ff2365f0fcd2`；真实 `auto` 冒烟三协议均返回 `OK`。Claude Code 2.1.327 已在同一会话完成 Read、Bash、Edit 和结果回传，`Edit` 首次失败后重试成功。验收文档：`docs/2026-11-20-auto-claude-code-acceptance.md`。
   - 升级前备份：`/Users/Zhuanz/Library/Application Support/notion-manager/backups/pre-auto-agent-20261120-114321`，含旧二进制、配置、账号 JSON、Token 统计和一致性请求日志库。

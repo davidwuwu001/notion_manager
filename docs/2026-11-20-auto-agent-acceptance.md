@@ -15,4 +15,10 @@
 - 收到已提交正文时转发可确认的增量，临时文本可由上游修订。只有收到 turn_completed 才正常结束；提前 EOF 触发失败。工具调用经整批验证后交给客户端。
 - 首轮候选真实验收发现用户消息的富文本数组可导致 502。已按事件类型解码并补同形状回归，修复后的真实 CLI 验收通过。Codex 的隔离环境需要可执行的 apply_patch helper。
 - `go test ./... -count=1`、`go vet ./...`、`go test -race ./internal/proxy ./cmd/notion-manager -count=1` 与 `git diff --check` 通过。
-- 本轮为候选构建验收。本机常用 8081 服务继续运行此前版本。真实 MCP 工具、长时间运行和全部精选模型未在本轮验收。
+- 真实 MCP 工具、长时间运行和全部精选模型未在本轮验收。
+
+## 本机部署
+
+从 Git 提交 `05c7724` 的干净源码归档重新运行 Go 全量测试和 vet，使用 `go build -trimpath` 构建。本机 8081 的二进制 SHA256 为 `719ddd88f76a0b731eebe4fb796633099418638fb0cf77217bb0ed4cec704e23`。
+
+切换前进行中请求为 0，已备份旧程序、配置、账号数据和通过 SQLite quick_check 的数据库。沿用原 launchctl 任务启动后，6 个账号可用，原 API Key 可读取 40 个模型及新版工具能力。部署后的首次 Responses 请求已记为成功，但严格的固定短语断言未通过。第二次真实 Auto 请求返回 completed，算术结果正确。双客户端完整工具链验收对应上面的隔离实例。
