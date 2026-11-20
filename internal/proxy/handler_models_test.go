@@ -60,7 +60,7 @@ func TestHandlePublicModels_UsesPoolModelsAndNormalizesIDs(t *testing.T) {
 		gotIDs = append(gotIDs, item.ID)
 	}
 
-	wantIDs := []string{"gpt-5.4", "opus-4.6"}
+	wantIDs := []string{"auto", "gpt-5.4", "opus-4.6"}
 	if !reflect.DeepEqual(gotIDs, wantIDs) {
 		t.Fatalf("unexpected model ids: got %v want %v", gotIDs, wantIDs)
 	}
@@ -96,7 +96,7 @@ func TestHandlePublicModels_FallsBackToDefaultModelMap(t *testing.T) {
 		gotIDs = append(gotIDs, item.ID)
 	}
 
-	wantIDs := []string{"gemini-2.5-flash", "sonnet-4.6"}
+	wantIDs := []string{"auto", "gemini-2.5-flash", "sonnet-4.6"}
 	if !reflect.DeepEqual(gotIDs, wantIDs) {
 		t.Fatalf("unexpected fallback models: got %v want %v", gotIDs, wantIDs)
 	}

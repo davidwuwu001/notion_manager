@@ -32,6 +32,8 @@ func TestDeveloperDashboardBrowserFixture(t *testing.T) {
 	var ids []string
 	for i := 0; i < 5; i++ {
 		limit := &proxy.CreditRateLimit{Status: "within_limit"}
+		limit.Standard = &proxy.CreditBucket{Used: float64(i) + 0.25, Limit: 1500, PeriodEndMs: now.AddDate(0, 0, 20).UnixMilli()}
+		limit.Select = &proxy.CreditBucket{Used: float64(i), Limit: 500, PeriodEndMs: now.AddDate(0, 0, 20).UnixMilli()}
 		limit.Window.Used, limit.Window.Limit, limit.Window.Window = float64(i*12), 100, "6h"
 		limit.BillingPeriodWindow.Used, limit.BillingPeriodWindow.Limit = float64(i*3), 100
 		status := proxy.QuotaSourceStatus{CheckedAtMs: now.UnixMilli(), SucceededAtMs: now.UnixMilli()}
@@ -67,6 +69,9 @@ func TestDeveloperDashboardBrowserFixture(t *testing.T) {
 	auth := proxy.NewDashboardAuth("", "fixture-not-a-secret")
 	deps := &proxy.RegisterJobsDeps{Pool: pool, AccountsDir: "accounts", Auth: auth, BusinessOnly: true}
 	mux := newMux(pool, "accounts", "fixture-not-a-secret", auth, proxy.InitUsageStats(""), deps, store)
+	access, err := proxy.NewAccessStore("")
+	if err != nil { t.Fatal(err) }
+	mux.HandleFunc("/admin/access", proxy.HandleAdminAccess(access, pool, auth))
 	stop := make(chan struct{})
 	var once sync.Once
 	mux.HandleFunc("/fixture/add-request", func(w http.ResponseWriter, r *http.Request) { addLog("req_fixture_poll_update"); w.WriteHeader(204) })

@@ -257,6 +257,20 @@ export function openBestProxy() {
 
 // --- Account Management API ---
 
+export async function testAccountModel(accountId: string, model: string): Promise<{ ok: boolean; duration_ms: number; reason?: string }> {
+  const resp = await fetch('/admin/accounts/test', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ account_id: accountId, model }) })
+  if (!resp.ok) {
+    if (resp.status === 429) return { ok: false, duration_ms: 0, reason: 'test_busy' }
+    if (resp.status === 401) { window.dispatchEvent(new Event('notion-manager-unauthorized')); return { ok: false, duration_ms: 0, reason: 'authentication_failed' } }
+    if (resp.status === 400) return { ok: false, duration_ms: 0, reason: 'model_unavailable' }
+    return { ok: false, duration_ms: 0, reason: 'inference_failed' }
+  }
+  const value = await readJson<{ok: boolean; duration_ms: number; reason?: string}>(resp, 'invalid test response')
+  const safe = new Set(['timeout', 'cancelled', 'quota_exhausted', 'model_unavailable', 'empty_response', 'authentication_failed', 'permission_denied', 'rate_limited', 'upstream_error', 'network_error', 'inference_failed'])
+  if (value.reason && !safe.has(value.reason)) value.reason = 'inference_failed'
+  return value
+}
+
 export interface AddAccountResult {
   status?: string
   error?: string

@@ -435,7 +435,7 @@ func TestAvailableCountUsesRoutingAndModelsExcludePausedMembers(t *testing.T) {
 		t.Fatal("availability disagrees with routing")
 	}
 	models := pool.AllModels()
-	if len(models) != 1 || models[0].ID != "active" {
+	if len(models) != 2 || models[0].ID != "active" || models[1].ID != autoModelID {
 		t.Fatalf("advertised paused models: %+v", models)
 	}
 }

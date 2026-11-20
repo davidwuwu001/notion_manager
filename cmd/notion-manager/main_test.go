@@ -32,6 +32,51 @@ func TestRequiresAPIKey(t *testing.T) {
 	}
 }
 
+func TestScopedKeyMiddlewareKeepsMasterUnrestricted(t *testing.T) {
+	store, err := proxy.NewAccessStore("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := proxy.ComputeAccountID("u", "s")
+	if err = store.SetGroup("work", []string{id}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.CreateKey("key", "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := apiKeyAuthMiddlewareWithAccess("master", store, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scope := proxy.AccessScopeFromContext(r.Context())
+		if r.Header.Get("Authorization") == "Bearer master" {
+			if scope != nil {
+				t.Error("master unexpectedly scoped")
+			}
+		} else if scope == nil || !scope.Allowed[id] {
+			t.Error("missing scope")
+		}
+		w.WriteHeader(204)
+	}))
+	for _, key := range []string{"master", created.Secret} {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest("GET", "/v1/models", nil)
+		r.Header.Set("Authorization", "Bearer "+key)
+		h.ServeHTTP(w, r)
+		if w.Code != 204 {
+			t.Fatalf("key rejected %d", w.Code)
+		}
+	}
+	if err = store.DeleteKey(created.ID); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/v1/models", nil)
+	r.Header.Set("Authorization", "Bearer "+created.Secret)
+	h.ServeHTTP(w, r)
+	if w.Code != 401 {
+		t.Fatal("revoked key accepted")
+	}
+}
+
 func TestAPIKeyAuthMiddleware_ProtectsModelsRoutes(t *testing.T) {
 	handler := apiKeyAuthMiddleware("sk-test", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)

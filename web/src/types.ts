@@ -47,11 +47,15 @@ export interface AccountInfo {
   premium_limit?: number
   rate_limit?: {
     status: string
+    standard?: { used: number; limit: number; periodEndMs?: number }
+    select?: { used: number; limit: number; periodEndMs?: number }
     window: { used: number; limit: number; window: string }
     rolling_reset_at_ms: number
     billingPeriodWindow: { used: number; limit: number; periodEndMs: number }
   }
   rate_limit_error?: string
+  credit_standard_status?: 'current' | 'stale' | 'expired' | 'unknown'
+  credit_select_status?: 'current' | 'stale' | 'expired' | 'unknown'
   quota_sources?: Partial<Record<'basic' | 'premium' | 'allowance', { checked_at_ms: number; succeeded_at_ms: number; error?: string }>>
   token_v2?: string
   registered_via?: string
@@ -117,6 +121,8 @@ export interface RefreshStatus {
 // fields reflect ALL accounts regardless of the current ?q= filter, so
 // the headline numbers stay stable while the user searches.
 export interface AccountSummary {
+  standard_credits?: { used: number; limit: number; remaining: number; known: number; unknown: number; stale: number }
+  select_credits?: { used: number; limit: number; remaining: number; known: number; unknown: number; stale: number }
   exhausted_only: number
   no_workspace: number
   premium_accounts: number
@@ -289,7 +295,7 @@ export interface RequestAnalytics extends LogCoverage {
 }
 
 export interface RoutingConfig {
-  mode: 'quota' | 'round_robin'
+  mode: 'quota' | 'round_robin' | 'latency'
   max_attempts: number
   max_concurrent_per_account: number
   disabled_account_ids: string[]

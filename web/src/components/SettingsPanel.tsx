@@ -5,6 +5,7 @@ import type { SearchSettings } from '../api'
 import type { RoutingConfig } from '../types'
 import { buttonClass, inputClass, Panel, ResourceState, useAdminResource } from './DashboardShared'
 import { HistoryDrawer } from './HistoryDrawer'
+import { AccessGroups } from './AccessGroups'
 
 export function SettingsPanel() {
   const { t } = useTranslation()
@@ -60,12 +61,13 @@ export function SettingsPanel() {
       <ResourceState {...routing} retry={routing.reload} />
       {routingDraft && <form className="space-y-4" onSubmit={event => { event.preventDefault(); void save('routing') }}>
         <p className="text-[12px] text-text-secondary">{t('upgrade.pool_note')}</p>
-        <label className="flex flex-col gap-2 text-sm">{t('upgrade.mode')}<select className={inputClass} value={routingDraft.mode} disabled={!!saving} onChange={event => setRoutingDraft(value => value && ({ ...value, mode: event.target.value as RoutingConfig['mode'] }))}><option value="quota">{t('upgrade.mode_quota')}</option><option value="round_robin">{t('upgrade.mode_round_robin')}</option></select></label>
+        <label className="flex flex-col gap-2 text-sm">{t('upgrade.mode')}<select className={inputClass} value={routingDraft.mode} disabled={!!saving} onChange={event => setRoutingDraft(value => value && ({ ...value, mode: event.target.value as RoutingConfig['mode'] }))}><option value="quota">{t('upgrade.mode_quota')}</option><option value="round_robin">{t('upgrade.mode_round_robin')}</option><option value="latency">{t('group_keys.latency')}</option></select></label>
         <div className="grid sm:grid-cols-3 gap-4">{(['max_attempts', 'max_concurrent_per_account', 'retention_days'] as const).map(key => <label key={key} className="flex flex-col gap-2 text-sm">{t(`upgrade.${key}`)}<input type="number" min={key === 'retention_days' ? 1 : 0} max={key === 'retention_days' ? 3650 : undefined} step={1} className={inputClass} value={Number.isNaN(routingDraft[key]) ? '' : routingDraft[key]} disabled={!!saving} onChange={event => setRoutingDraft(value => value && ({ ...value, [key]: event.target.value === '' ? NaN : Number(event.target.value) }))} required /></label>)}</div>
         <p className="text-[12px] text-text-secondary">{t('upgrade.budget_note')}</p><p className="text-[12px] text-text-secondary">{t('upgrade.retention_note')}</p>
         <button className={buttonClass} disabled={!!saving}>{saving === 'routing' ? t('upgrade.saving') : t('common.save')}</button>
       </form>}
     </Panel>
+    <AccessGroups />
     <Panel title={t('upgrade.import_policy')}><p className="text-sm text-text-secondary mb-3">{t('upgrade.business_only')}</p><button className={buttonClass} onClick={() => setHistoryOpen(true)}>{t('upgrade.history_readonly')}</button></Panel>
     <HistoryDrawer open={historyOpen} onClose={() => setHistoryOpen(false)} />
   </div>

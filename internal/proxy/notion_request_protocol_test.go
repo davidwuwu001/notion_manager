@@ -475,6 +475,7 @@ func TestParseNDJSONStreamPatchV2ForwardsToolUseEntries(t *testing.T) {
 		`{"type":"patch","v":[{"o":"a","p":"/s/1/value/-","v":{"type":"tool_use","id":"tool-later","name":"laterTool","content":"DO_NOT_EMIT","input":{"value":2}}}]}`,
 		`{"type":"patch","v":[{"o":"a","p":"/s/1/value/-","v":{"type":"tool_use","id":"tool-later","name":"laterTool","content":"DO_NOT_EMIT","input":{"value":2}}}]}`,
 		`{"type":"patch","v":[{"o":"a","p":"/s/1/value/-","v":{"type":"tool_use","id":"tool-initial","name":"initialTool","content":"DO_NOT_EMIT","input":{"value":1}}}]}`,
+		`{"type":"patch","v":[{"o":"a","p":"/s/1/finishedAt","v":2}]}`,
 	}, "\n")
 
 	var textOutput strings.Builder

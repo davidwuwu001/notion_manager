@@ -183,6 +183,14 @@ func cloneQuotaInfo(src *QuotaInfo) *QuotaInfo {
 	}
 	if src.RateLimit != nil {
 		limit := *src.RateLimit
+		if limit.Standard != nil {
+			value := *limit.Standard
+			limit.Standard = &value
+		}
+		if limit.Select != nil {
+			value := *limit.Select
+			limit.Select = &value
+		}
 		dst.RateLimit = &limit
 	}
 	return &dst
@@ -1106,6 +1114,9 @@ func (p *AccountPool) AllModels() []ModelEntry {
 			models = append(models, ModelEntry{Name: name, ID: id})
 		}
 	}
+	if len(models) > 0 && !seen[autoModelID] {
+		models = append(models, ModelEntry{Name: "Auto", ID: autoModelID})
+	}
 	return models
 }
 
@@ -1562,6 +1573,7 @@ func (p *AccountPool) GetAccountDetails() []map[string]interface{} {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	var details []map[string]interface{}
+	now := time.Now()
 	for _, acc := range p.accounts {
 		quota := acc.quotaSnapshot()
 		models := acc.modelsSnapshot()
@@ -1595,6 +1607,17 @@ func (p *AccountPool) GetAccountDetails() []map[string]interface{} {
 			entry["eligible"] = quota.Info.IsEligible
 			entry["rate_limit"] = quota.Info.RateLimit
 			entry["rate_limit_error"] = quota.Info.RateLimitError
+			var standard, selected *CreditBucket
+			if quota.Info.RateLimit != nil {
+				standard, selected = quota.Info.RateLimit.Standard, quota.Info.RateLimit.Select
+			}
+			var checked time.Time
+			if quota.CheckedAt != nil {
+				checked = *quota.CheckedAt
+			}
+			source := quota.Info.Sources["allowance"]
+			entry["credit_standard_status"] = creditBucketStatus(standard, source, checked, now)
+			entry["credit_select_status"] = creditBucketStatus(selected, source, checked, now)
 			entry["usage"] = quota.Info.SpaceUsage
 			entry["limit"] = quota.Info.SpaceLimit
 			entry["space_usage"] = quota.Info.SpaceUsage

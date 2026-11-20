@@ -1,20 +1,16 @@
 package proxy
 
-import (
-	"encoding/json"
-	"net/http"
-	"strings"
-)
+import "net/http"
 
-// toolBridgeStream emits only confirmed JSON calls; ambiguous prose/fences use the final parser.
+// toolBridgeStream emits message and thinking events. Tool calls are emitted
+// only by the final response path after validation of the complete batch.
 type toolBridgeStream struct {
-	w                  http.ResponseWriter
-	flusher            http.Flusher
-	id, model, pending string
-	started, thinking  bool
-	thinkingEmitted    bool
-	index              int
-	calls              []ToolCall
+	w                 http.ResponseWriter
+	flusher           http.Flusher
+	id, model         string
+	started, thinking bool
+	thinkingEmitted   bool
+	index             int
 }
 
 func (s *toolBridgeStream) start() {
@@ -68,39 +64,4 @@ func (s *toolBridgeStream) think(delta string, done bool, signature string) {
 	sendAnthropicSSE(s.w, s.flusher, "content_block_delta", map[string]interface{}{
 		"type": "content_block_delta", "index": s.index, "delta": map[string]interface{}{"type": "thinking_delta", "thinking": delta},
 	})
-}
-
-func (s *toolBridgeStream) feed(delta string) {
-	s.pending += delta
-	for {
-		input := strings.TrimSpace(s.pending)
-		if !strings.HasPrefix(input, "{") {
-			return
-		}
-		decoder := json.NewDecoder(strings.NewReader(input))
-		var raw json.RawMessage
-		if decoder.Decode(&raw) != nil {
-			return
-		}
-		calls, remaining, ok := parseToolCalls(string(raw))
-		if !ok || remaining != "" || len(calls) != 1 {
-			return
-		}
-		call := calls[0]
-		if call.Function.Name == "__done__" || call.Function.Name == "WebSearch" || call.Function.Name == "" {
-			return
-		}
-		s.start()
-		s.closeThinking("")
-		sendAnthropicSSE(s.w, s.flusher, "content_block_start", map[string]interface{}{
-			"type": "content_block_start", "index": s.index, "content_block": map[string]interface{}{"type": "tool_use", "id": call.ID, "name": call.Function.Name, "input": map[string]interface{}{}},
-		})
-		sendAnthropicSSE(s.w, s.flusher, "content_block_delta", map[string]interface{}{
-			"type": "content_block_delta", "index": s.index, "delta": map[string]interface{}{"type": "input_json_delta", "partial_json": call.Function.Arguments},
-		})
-		sendAnthropicSSE(s.w, s.flusher, "content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": s.index})
-		s.index++
-		s.calls = append(s.calls, call)
-		s.pending = input[int(decoder.InputOffset()):]
-	}
 }

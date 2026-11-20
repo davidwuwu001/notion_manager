@@ -318,8 +318,8 @@ func needsFreshThreadRecovery(messages []ChatMessage) bool {
 // buildFreshThreadRecoveryMessages collapses prior conversation state into a
 // single self-contained user prompt for use when we must recover onto a brand
 // new Notion thread (for example after session loss or account failover).
-func buildRecoveryMessages(messages []ChatMessage, skipEntry func(ChatMessage, string) bool) []ChatMessage {
-	if !needsFreshThreadRecovery(messages) {
+func buildRecoveryMessages(messages []ChatMessage, skipEntry func(ChatMessage, string) bool, force bool) []ChatMessage {
+	if !force && !needsFreshThreadRecovery(messages) {
 		return messages
 	}
 
@@ -447,11 +447,15 @@ func buildRecoveryMessages(messages []ChatMessage, skipEntry func(ChatMessage, s
 }
 
 func buildFreshThreadRecoveryMessages(messages []ChatMessage) []ChatMessage {
-	return buildRecoveryMessages(messages, nil)
+	return buildRecoveryMessages(messages, nil, false)
 }
 
 func buildToolBridgeRecoveryMessages(messages []ChatMessage) []ChatMessage {
 	return buildRecoveryMessages(messages, func(msg ChatMessage, content string) bool {
 		return msg.Role == "assistant" && detectToolBridgeNoToolResponse(content)
-	})
+	}, false)
+}
+
+func buildAgentThreadPromptMessages(messages []ChatMessage) []ChatMessage {
+	return buildRecoveryMessages(messages, nil, true)
 }

@@ -575,6 +575,152 @@ func normalizeToolBridgeResidualText(text string) string {
 	return trimmed
 }
 
+// requiredToolChoice returns a contract only when the client explicitly
+// requires at least one tool or names a specific tool. Auto replies may be
+// ordinary answers or genuine safety refusals and must remain untouched.
+type toolChoiceContract struct {
+	choice  interface{}
+	allowed map[string]bool
+}
+
+func toolChoiceIsNone(choice interface{}) bool {
+	if contract, ok := choice.(toolChoiceContract); ok {
+		choice = contract.choice
+	}
+	if text, ok := choice.(string); ok {
+		return text == "none"
+	}
+	if value, ok := choice.(map[string]interface{}); ok {
+		return value["type"] == "none"
+	}
+	return false
+}
+
+func validateToolChoice(choice interface{}, tools []AnthropicTool) error {
+	if choice == nil {
+		return nil
+	}
+	var kind, name string
+	switch value := choice.(type) {
+	case string:
+		kind = value
+	case map[string]interface{}:
+		kind, _ = value["type"].(string)
+		name, _ = value["name"].(string)
+		if fn, ok := value["function"].(map[string]interface{}); ok && name == "" {
+			name, _ = fn["name"].(string)
+		}
+	default:
+		return errors.New("invalid tool_choice")
+	}
+	switch kind {
+	case "none", "auto":
+		return nil
+	case "any", "required":
+		if len(tools) == 0 {
+			return errors.New("tool_choice requires tools")
+		}
+		return nil
+	case "tool", "function":
+		if name == "" {
+			return errors.New("tool_choice requires a tool name")
+		}
+		for _, tool := range tools {
+			if tool.Name == name {
+				return nil
+			}
+		}
+		return errors.New("tool_choice refers to an undeclared tool")
+	default:
+		return errors.New("invalid tool_choice")
+	}
+}
+
+func requiredToolChoice(choices []interface{}) (bool, string) {
+	if len(choices) == 0 {
+		return false, ""
+	}
+	choiceValue := choices[0]
+	if contract, ok := choiceValue.(toolChoiceContract); ok {
+		choiceValue = contract.choice
+	}
+	switch choice := choiceValue.(type) {
+	case string:
+		return choice == "required" || choice == "any", ""
+	case map[string]interface{}:
+		kind, _ := choice["type"].(string)
+		if kind == "required" || kind == "any" {
+			return true, ""
+		}
+		if kind != "tool" && kind != "function" {
+			return false, ""
+		}
+		name, _ := choice["name"].(string)
+		if fn, ok := choice["function"].(map[string]interface{}); ok {
+			if name == "" {
+				name, _ = fn["name"].(string)
+			}
+		}
+		return name != "", name
+	default:
+		return false, ""
+	}
+}
+
+func requiredToolSatisfied(prepared preparedToolBridgeResponse, required bool, name string, allowed ...map[string]bool) bool {
+	if !required {
+		return true
+	}
+	// WebSearch is intercepted and executed internally rather than returned as
+	// a client tool call. It cannot satisfy an explicit tool-choice contract.
+	// Refuse before any internal search is launched, including mixed replies.
+	if prepared.WebSearchQuery != "" {
+		return false
+	}
+	found := false
+	var valid map[string]bool
+	if len(allowed) > 0 {
+		valid = allowed[0]
+	}
+	for _, call := range prepared.ToolCalls {
+		if valid != nil && !valid[call.Function.Name] {
+			return false
+		}
+		if name != "" && call.Function.Name != name {
+			return false
+		}
+		found = true
+	}
+	return found
+}
+
+func requiredToolAllowed(choices []interface{}) map[string]bool {
+	if len(choices) == 0 {
+		return nil
+	}
+	if contract, ok := choices[0].(toolChoiceContract); ok {
+		return contract.allowed
+	}
+	return nil
+}
+
+func declaredToolCalls(prepared preparedToolBridgeResponse, allowed map[string]bool) bool {
+	if allowed == nil {
+		return true
+	}
+	// An intercepted WebSearch runs a second upstream inference; only a
+	// declared search tool authorizes that bridge action.
+	if prepared.WebSearchQuery != "" && !allowed["WebSearch"] {
+		return false
+	}
+	for _, call := range prepared.ToolCalls {
+		if !allowed[call.Function.Name] {
+			return false
+		}
+	}
+	return true
+}
+
 func detectToolBridgeNoToolResponse(text string) bool {
 	normalized := normalizeToolBridgeResidualText(text)
 	if normalized == "" {
@@ -783,9 +929,16 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			writeAnthropicError(w, requestID, http.StatusBadRequest, "invalid request body: "+err.Error(), "invalid_request_error")
 			return
 		}
+		if p := probeFromContext(ctx); p != nil && p.snapshot().Protocol == probeAnthropic {
+			p.recordIngress(probeChoiceFor(req.ToolChoice), len(req.Tools), len(req.Tools))
+		}
 
 		if len(req.Messages) == 0 {
 			writeAnthropicError(w, requestID, http.StatusBadRequest, "messages is required", "invalid_request_error")
+			return
+		}
+		if err := validateToolChoice(req.ToolChoice, req.Tools); err != nil {
+			writeAnthropicError(w, requestID, http.StatusBadRequest, err.Error(), "invalid_request_error")
 			return
 		}
 		if req.OutputConfig != nil {
@@ -840,6 +993,30 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 
 		// Detect researcher mode — skip tools and file uploads
 		isResearcher := IsResearcherModel(model)
+		requiredTools, requiredName := requiredToolChoice([]interface{}{req.ToolChoice})
+		if isResearcher && requiredTools {
+			writeAnthropicError(w, requestID, http.StatusBadRequest, "research mode does not support required tool calls", "invalid_request_error")
+			return
+		}
+		if requiredTools {
+			if nativeSearchToolNames[requiredName] {
+				writeAnthropicError(w, requestID, http.StatusBadRequest, "explicit native search tool choice is not supported", "invalid_request_error")
+				return
+			}
+			if requiredName == "" {
+				hasClientTool := false
+				for _, tool := range req.Tools {
+					if !nativeSearchToolNames[tool.Name] {
+						hasClientTool = true
+						break
+					}
+				}
+				if !hasClientTool {
+					writeAnthropicError(w, requestID, http.StatusBadRequest, "required tool choice has no supported client tools", "invalid_request_error")
+					return
+				}
+			}
+		}
 		if isResearcher {
 			if len(fileAttachments) > 0 {
 				log.Printf("[researcher] ignoring %d file attachment(s) — not supported in researcher mode", len(fileAttachments))
@@ -871,8 +1048,13 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 		enableWorkspaceSearch = &workspaceSearchEnabled
 
 		// Convert Anthropic tools to OpenAI tools format for tool injection
-		hasTools := !isResearcher && len(req.Tools) > 0
+		hasTools := !isResearcher && len(req.Tools) > 0 && !toolChoiceIsNone(req.ToolChoice)
 		enableWebSearch := effectiveWebSearch
+		if toolChoiceIsNone(req.ToolChoice) || requiredTools {
+			enableWebSearch = false
+			workspaceSearchEnabled = false
+			enableWorkspaceSearch = &workspaceSearchEnabled
+		}
 
 		// ── Multi-turn session management ──
 		// Compute fingerprint BEFORE tool injection so it's stable across turns.
@@ -885,6 +1067,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 
 		if !isResearcher {
 			fingerprint = computeSessionFingerprintForRequest(messages, sessionSalt, resolvedModel)
+			fingerprint = ScopedFingerprint(fingerprint, AccessScopeFromContext(ctx))
 			releaseSession, ok := globalSessionManager.Acquire(fingerprint)
 			if !ok {
 				writeAnthropicError(w, requestID, http.StatusConflict, "another request is using this conversation", "invalid_request_error")
@@ -937,6 +1120,17 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			// instead of using Notion's server-side search which actually executes.
 			var toolDetectedWebSearch bool
 			convertedTools, toolDetectedWebSearch = filterNativeSearchTools(convertedTools)
+			if requiredTools {
+				filtered := convertedTools[:0]
+				for _, tool := range convertedTools {
+					if !nativeSearchToolNames[tool.Function.Name] {
+						filtered = append(filtered, tool)
+					}
+				}
+				convertedTools = filtered
+				toolDetectedWebSearch = false
+			}
+			probeFromContext(ctx).recordBridgeToolCount(len(convertedTools))
 			if len(convertedTools) > 0 && detectModelFamily(model) != familyAnthropic {
 				writeAnthropicError(w, requestID, http.StatusBadRequest, "custom tool bridge is supported only for Claude models; see /v1/capabilities", "invalid_request_error")
 				return
@@ -955,6 +1149,9 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 				}
 			}
 		}
+		if toolChoiceIsNone(req.ToolChoice) {
+			probeFromContext(ctx).recordBridgeToolCount(0)
+		}
 
 		// Snapshot the original (pre-injection) messages so failover to a
 		// fresh account can rebuild a self-contained prompt that carries the
@@ -963,6 +1160,10 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 		originalMessages := cloneChatMessages(messages)
 
 		// Try accounts with automatic failover
+		toolContract := toolChoiceContract{choice: req.ToolChoice, allowed: make(map[string]bool, len(req.Tools))}
+		for _, tool := range req.Tools {
+			toolContract.allowed[tool.Name] = true
+		}
 		tried := make(map[string]bool)
 		maxAttempts := pool.Count()
 		if budget := pool.RoutingSnapshot().MaxAttempts; budget > 0 && budget < maxAttempts {
@@ -980,7 +1181,11 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 				boundID = session.AccountID
 			}
 			selectionStarted := time.Now()
-			acc, release, selectionErr := pool.SelectForRequest(resolvedModel, isResearcher, tried, boundID)
+			var allowed map[string]bool
+			if scope := AccessScopeFromContext(ctx); scope != nil {
+				allowed = scope.Allowed
+			}
+			acc, release, selectionErr := pool.SelectForRequestScoped(resolvedModel, isResearcher, tried, boundID, allowed)
 			trace.RecordStage("account_selection", time.Since(selectionStarted))
 			if selectionErr != nil {
 				trace.FinishFailure("failed", "pool_unavailable")
@@ -1100,6 +1305,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			// For streaming responses, default to emitting thinking blocks even when
 			// the client did not explicitly request Anthropic thinking.
 			hasThinking := req.Thinking != nil || req.Stream
+			inferenceStarted := time.Now()
 			var reqErr error
 			if isResearcher {
 				// Researcher mode — always use thinking blocks for research progress
@@ -1110,9 +1316,9 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 					reqErr = handleResearcherNonStream(w, acc, requestMessages, model, requestID, hasThinking)
 				}
 			} else if req.Stream {
-				reqErr = handleAnthropicStream(w, acc, requestMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, useReadOnlyMode, uploadedAttachments, req.OutputConfig, currentSession)
+				reqErr = handleAnthropicStream(w, acc, requestMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, useReadOnlyMode, uploadedAttachments, req.OutputConfig, currentSession, toolContract)
 			} else {
-				reqErr = handleAnthropicNonStream(w, acc, requestMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, useReadOnlyMode, uploadedAttachments, req.OutputConfig, currentSession)
+				reqErr = handleAnthropicNonStream(w, acc, requestMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, useReadOnlyMode, uploadedAttachments, req.OutputConfig, currentSession, toolContract)
 			}
 
 			// Trigger an async live quota refresh after every call so the next
@@ -1125,6 +1331,9 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			}
 			if ctx.Err() != nil {
 				reqErr = ctx.Err()
+			}
+			if reqErr == nil {
+				pool.RecordRoutingLatency(acc, time.Since(inferenceStarted))
 			}
 			outcome, code := "success", ""
 			if reqErr != nil {
@@ -1701,7 +1910,7 @@ func streamAnthropicTextResponse(w http.ResponseWriter, acc *Account, messages [
 }
 
 // handleAnthropicStream handles streaming Anthropic response
-func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatMessage, model, requestID string, hasTools bool, hasThinking bool, enableWebSearch bool, enableWorkspaceSearch *bool, useReadOnlyMode bool, attachments []UploadedAttachment, outputConfig *AnthropicOutputConfig, session *Session) error {
+func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatMessage, model, requestID string, hasTools bool, hasThinking bool, enableWebSearch bool, enableWorkspaceSearch *bool, useReadOnlyMode bool, attachments []UploadedAttachment, outputConfig *AnthropicOutputConfig, session *Session, toolChoice ...interface{}) error {
 	var fullContent strings.Builder
 	var finalUsage *UsageInfo
 	defer func() {
@@ -1716,6 +1925,10 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 	knownToolCallURLs := make(map[string][]string)
 
 	disableBuiltin := AppConfig.Proxy.DisableNotionPrompt
+	requiredChoice, _ := requiredToolChoice(toolChoice)
+	if (len(toolChoice) > 0 && toolChoiceIsNone(toolChoice[0])) || requiredChoice {
+		disableBuiltin = true
+	}
 
 	callOpts := CallOptions{
 		Context:               inferenceContext(w),
@@ -1742,6 +1955,7 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 		return fmt.Errorf("streaming not supported")
 	}
 	live := &toolBridgeStream{w: w, flusher: flusher, id: requestID, model: model}
+	required, requiredName := requiredToolChoice(toolChoice)
 	if hasThinking {
 		callOpts.ThinkingCallback = live.think
 	}
@@ -1750,13 +1964,18 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 	cbErr := inferenceCaller(acc, messages, model, disableBuiltin, func(delta string, done bool, usage *UsageInfo) {
 		if delta != "" {
 			fullContent.WriteString(delta)
-			live.feed(delta)
 		}
 		if usage != nil {
 			finalUsage = usage
 		}
 	}, callOpts)
 	TraceRequest(inferenceContext(w)).RecordStage("upstream", time.Since(upstreamStarted))
+	if cbErr == nil || len(nativeToolUses) > 0 {
+		probeFromContext(inferenceContext(w)).recordNativeClass(nativeToolUses, requiredToolAllowed(toolChoice))
+	}
+	if p := probeFromContext(inferenceContext(w)); p != nil && cbErr == nil {
+		p.recordWrapperPresence(fullContent.String())
+	}
 
 	if cbErr != nil {
 		return cbErr
@@ -1774,18 +1993,20 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 	var prepared preparedToolBridgeResponse
 	if hasTools {
 		parseStarted := time.Now()
+		if !mixedToolRepresentationsAgree(contentStr, nativeToolUses) {
+			return ErrToolBridgeNoTool
+		}
 		prepared = prepareToolBridgeResponse(contentStr, nativeToolUses)
+		declaredOK := declaredToolCalls(prepared, requiredToolAllowed(toolChoice))
+		requiredOK := declaredOK && requiredToolSatisfied(prepared, required, requiredName, requiredToolAllowed(toolChoice))
+		probeFromContext(inferenceContext(w)).recordPrepared(contentStr, nativeToolUses, prepared, declaredOK, requiredOK, required)
+		if !declaredOK {
+			return ErrToolBridgeNoTool
+		}
+		if !requiredOK {
+			return ErrToolBridgeNoTool
+		}
 		TraceRequest(inferenceContext(w)).RecordStage("tool_parse", time.Since(parseStarted))
-		if len(prepared.ToolCalls) < len(live.calls) {
-			return fmt.Errorf("tool stream changed after emission")
-		}
-		for i, call := range live.calls {
-			parsed := prepared.ToolCalls[i]
-			if parsed.Function != call.Function {
-				return fmt.Errorf("tool stream changed after emission")
-			}
-			prepared.ToolCalls[i] = call
-		}
 		actionDetected := prepared.HasCalls || prepared.WebSearchQuery != "" || prepared.DoneText != ""
 		if !actionDetected && detectToolBridgeNoToolResponse(prepared.Remaining) {
 			log.Printf("[bridge] %s detected no-tool identity-drift text (%d chars), requesting clean retry", requestID, len(prepared.Remaining))
@@ -1913,11 +2134,7 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 
 		// Send tool_use blocks
 		if hasCalls {
-			for i, tc := range toolCalls {
-				if i < len(live.calls) {
-					loggedContentBlocks = append(loggedContentBlocks, AnthropicContentBlock{Type: "tool_use", ID: tc.ID, Name: tc.Function.Name, Input: json.RawMessage(tc.Function.Arguments)})
-					continue
-				}
+			for _, tc := range toolCalls {
 				sendAnthropicSSE(w, flusher, "content_block_start", map[string]interface{}{
 					"type":  "content_block_start",
 					"index": blockIndex,
@@ -1973,7 +2190,12 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 }
 
 // handleAnthropicNonStream handles non-streaming Anthropic response
-func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []ChatMessage, model, requestID string, hasTools bool, hasThinking bool, enableWebSearch bool, enableWorkspaceSearch *bool, useReadOnlyMode bool, attachments []UploadedAttachment, outputConfig *AnthropicOutputConfig, session *Session) error {
+func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []ChatMessage, model, requestID string, hasTools bool, hasThinking bool, enableWebSearch bool, enableWorkspaceSearch *bool, useReadOnlyMode bool, attachments []UploadedAttachment, outputConfig *AnthropicOutputConfig, session *Session, toolChoice ...interface{}) error {
+	disableBuiltin := AppConfig.Proxy.DisableNotionPrompt
+	requiredChoice, _ := requiredToolChoice(toolChoice)
+	if (len(toolChoice) > 0 && toolChoiceIsNone(toolChoice[0])) || requiredChoice {
+		disableBuiltin = true
+	}
 	var fullContent strings.Builder
 	var finalUsage *UsageInfo
 	defer func() {
@@ -2019,7 +2241,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 	if hasTools {
 		callOpts.NativeToolUses = &nativeToolUses
 		// Format-based injection: tools embedded in user messages, use normal chat path
-		err = inferenceCaller(acc, messages, model, AppConfig.Proxy.DisableNotionPrompt, func(delta string, done bool, usage *UsageInfo) {
+		err = inferenceCaller(acc, messages, model, disableBuiltin, func(delta string, done bool, usage *UsageInfo) {
 			if delta != "" {
 				fullContent.WriteString(delta)
 			}
@@ -2028,7 +2250,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 			}
 		}, callOpts)
 	} else {
-		err = inferenceCaller(acc, messages, model, AppConfig.Proxy.DisableNotionPrompt, func(delta string, done bool, usage *UsageInfo) {
+		err = inferenceCaller(acc, messages, model, disableBuiltin, func(delta string, done bool, usage *UsageInfo) {
 			if delta != "" {
 				fullContent.WriteString(delta)
 			}
@@ -2039,6 +2261,12 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 	}
 
 	TraceRequest(inferenceContext(w)).RecordStage("upstream", time.Since(upstreamStarted))
+	if hasTools && (err == nil || len(nativeToolUses) > 0) {
+		probeFromContext(inferenceContext(w)).recordNativeClass(nativeToolUses, requiredToolAllowed(toolChoice))
+	}
+	if p := probeFromContext(inferenceContext(w)); p != nil && hasTools && err == nil {
+		p.recordWrapperPresence(fullContent.String())
+	}
 	if err != nil {
 		return err
 	}
@@ -2054,7 +2282,20 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 	var prepared preparedToolBridgeResponse
 	if hasTools {
 		parseStarted := time.Now()
+		if !mixedToolRepresentationsAgree(content, nativeToolUses) {
+			return ErrToolBridgeNoTool
+		}
 		prepared = prepareToolBridgeResponse(content, nativeToolUses)
+		declaredOK := declaredToolCalls(prepared, requiredToolAllowed(toolChoice))
+		required, requiredName := requiredToolChoice(toolChoice)
+		requiredOK := declaredOK && requiredToolSatisfied(prepared, required, requiredName, requiredToolAllowed(toolChoice))
+		probeFromContext(inferenceContext(w)).recordPrepared(content, nativeToolUses, prepared, declaredOK, requiredOK, required)
+		if !declaredOK {
+			return ErrToolBridgeNoTool
+		}
+		if !requiredOK {
+			return ErrToolBridgeNoTool
+		}
 		TraceRequest(inferenceContext(w)).RecordStage("tool_parse", time.Since(parseStarted))
 		actionDetected := prepared.HasCalls || prepared.WebSearchQuery != "" || prepared.DoneText != ""
 		if !actionDetected && detectToolBridgeNoToolResponse(prepared.Remaining) {
@@ -2166,7 +2407,16 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 
 	LogAPIOutputJSON(requestID, "anthropic non-stream response", resp)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	if err := json.NewEncoder(w).Encode(resp); err == nil {
+		if p := probeFromContext(inferenceContext(w)); p != nil && p.snapshot().Protocol == probeAnthropic {
+			for _, block := range contentBlocks {
+				if block.Type == "tool_use" {
+					p.recordWireTool()
+				}
+			}
+			p.recordWireTerminal()
+		}
+	}
 	return nil
 }
 
@@ -2186,7 +2436,23 @@ func sendAnthropicSSE(w http.ResponseWriter, flusher http.Flusher, eventType str
 		}
 	}
 	raw, _ := json.Marshal(data)
-	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, raw)
+	_, writeErr := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, raw)
+	if writeErr == nil {
+		if iw, ok := w.(*inferenceWriter); ok {
+			if p := probeFromContext(iw.ctx); p != nil && p.snapshot().Protocol == probeAnthropic {
+				if eventType == "content_block_start" {
+					if m, ok := data.(map[string]interface{}); ok {
+						if b, ok := m["content_block"].(map[string]interface{}); ok && b["type"] == "tool_use" {
+							p.recordWireTool()
+						}
+					}
+				}
+				if eventType == "message_stop" {
+					p.recordWireTerminal()
+				}
+			}
+		}
+	}
 	flusher.Flush()
 }
 

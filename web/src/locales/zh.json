@@ -75,6 +75,15 @@
     "empty": "暂未获取到模型，请添加可用账号并刷新配额。"
   },
   "ai_usage": {
+    "credit_summary": "账期积分总览",
+    "standard": "标准模式积分（已用 / 额度）",
+    "select": "精选模式积分（已用 / 额度）",
+    "credit_known": "{{known}} 个已知 · {{unknown}} 个未知；额度按账号独立使用",
+    "credit_unknown": "未知",
+    "remaining": "账面剩余 {{value}}",
+    "credit_stale_count": "其中 {{count}} 个是旧缓存，请刷新",
+    "credit_stale": "缓存较旧或刷新失败",
+    "credit_expired": "账期已结束，请刷新",
     "title": "Notion AI 套餐用量",
     "rolling": "滚动周期（{{window}}）",
     "monthly": "月度",
@@ -84,6 +93,8 @@
     "unavailable": "暂未获取套餐用量，请刷新配额重试",
     "note": "套餐滚动/月度用量与兼容 Basic/Premium 指标分开计量；以最近一次成功检查为准。"
   },
+  "model_test": {"choose":"选择要测试的模型", "no_models":"暂无可用模型", "button":"测试模型", "running":"正在测试…", "success":"调用成功 · {{seconds}} 秒", "failed":"调用失败，请检查登录状态、额度和连接", "cost_note":"测试会调用此账号并消耗少量积分；具体消耗取决于模型。", "reason_timeout":"测试超时", "reason_cancelled":"测试已取消", "reason_quota_exhausted":"积分已耗尽", "reason_model_unavailable":"模型不可用", "reason_empty_response":"模型返回空内容", "reason_authentication_failed":"登录已失效", "reason_permission_denied":"无权使用该模型或工作区", "reason_rate_limited":"请求过于频繁，请稍后重试", "reason_upstream_error":"上游服务错误", "reason_network_error":"网络连接失败", "reason_inference_failed":"模型调用失败", "reason_test_busy":"已有测试正在进行"},
+  "group_keys": {"title":"账号组与受限密钥", "note":"原有密钥仍可使用全部账号。受限密钥只允许访问绑定组内账号；空组不会调用任何账号。", "groups":"账号组", "keys":"受限 API Key", "edit":"编辑", "delete":"删除", "revoke":"撤销", "group_name":"组名称", "key_name":"密钥名称", "save_group":"保存账号组", "new_group":"新建组", "choose_group":"选择账号组", "create_key":"创建密钥", "save_key":"保存密钥设置", "new_key":"创建新密钥", "secret_once":"请立即复制并妥善保存；关闭后无法再次查看。", "close_secret":"关闭", "delete_group_confirm":"删除此组将同时撤销绑定的所有密钥，确定删除？", "delete_key_confirm":"确定撤销此密钥？", "failed":"操作失败，请检查名称、账号和网络后重试。", "latency":"响应速度优先（仅使用成功样本）", "missing_account":"已不存在的账号：{{id}}", "remove_missing":"请取消勾选已不存在的账号后再保存；不会自动移除。"},
   "auth": {
     "prompt": "输入管理密钥以访问 Dashboard",
     "placeholder": "管理密钥",
@@ -364,6 +375,7 @@
     "mode": "调度模式",
     "mode_quota": "余量优先（同分轮转）",
     "mode_round_robin": "全池轮询",
+    "mode_latency": "响应速度优先",
     "max_attempts": "每请求尝试预算",
     "max_concurrent_per_account": "每账号并发上限",
     "retention_days": "请求日志保留天数",

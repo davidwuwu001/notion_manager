@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-func TestToolStreamEmitsConfirmedCallBeforeInferenceReturns(t *testing.T) {
+func TestToolStreamWaitsForInferenceToValidateCalls(t *testing.T) {
 	originalConfig, originalCaller := AppConfig, inferenceCaller
 	AppConfig = DefaultConfig()
 	t.Cleanup(func() { AppConfig, inferenceCaller = originalConfig, originalCaller })
@@ -22,8 +22,8 @@ func TestToolStreamEmitsConfirmedCallBeforeInferenceReturns(t *testing.T) {
 			t.Fatal("incomplete JSON emitted a tool action")
 		}
 		cb(`a.ts"}}`, false, nil)
-		if !strings.Contains(recorder.Body.String(), "input_json_delta") || !recorder.Flushed {
-			t.Fatal("complete tool action was buffered until inference ended")
+		if strings.Contains(recorder.Body.String(), "input_json_delta") {
+			t.Fatal("tool action was emitted before the full response was validated")
 		}
 		cb("\n"+`{"name":"Read","arguments":{"file_path":"b.ts"}}`, false, nil)
 		cb("", true, &UsageInfo{PromptTokens: 123, CompletionTokens: 7})

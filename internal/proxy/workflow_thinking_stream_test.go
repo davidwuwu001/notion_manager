@@ -9,7 +9,7 @@ import (
 func TestParseNDJSONStreamEmitsWorkflowProcessThinking(t *testing.T) {
 	stream := strings.Join([]string{
 		`{"type":"agent-inference","id":"step1","value":[{"type":"thinking","content":"Let me search"}]}`,
-		`{"type":"agent-inference","id":"step1","value":[{"type":"thinking","content":"Let me search for information about Notion Agent."},{"type":"tool_use","id":"toolu_1","name":"search","content":"{\"web\":{\"queries\":[\"What is Notion Agent"}}]}`,
+		`{"type":"agent-inference","id":"step1","value":[{"type":"thinking","content":"Let me search for information about Notion Agent."},{"type":"tool_use","id":"toolu_1","name":"search","content":"{\"web\":{\"queries\":[\"What is Notion Agent"}]}`,
 		`{"type":"agent-inference","id":"step1","value":[{"type":"thinking","content":"Let me search for information about Notion Agent."},{"type":"tool_use","id":"toolu_1","name":"search","content":"{\"web\":{\"queries\":[\"What is Notion Agent and what can you do with it?\"]}}"}],"finishedAt":1,"inputTokens":10,"outputTokens":2}`,
 		`{"type":"agent-search-extracted-results","toolCallId":"toolu_1","results":[{"id":"webpage://?url=https%3A%2F%2Fexample.com%2Fagent","title":"How to work with your Agent"},{"id":"webpage://?url=https%3A%2F%2Fexample.com%2Fnotion-agent","title":"Notion Agent"}]}`,
 		`{"type":"agent-inference","id":"step2","value":[{"type":"thinking","content":"Let me summarize"}]}`,

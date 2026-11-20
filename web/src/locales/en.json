@@ -75,6 +75,15 @@
     "empty": "No models found. Add an available account and refresh quota."
   },
   "ai_usage": {
+    "credit_summary": "Billing period credits",
+    "standard": "Standard credits (used / limit)",
+    "select": "Select credits (used / limit)",
+    "credit_known": "{{known}} known · {{unknown}} unknown; quotas are independent",
+    "credit_unknown": "Unknown",
+    "remaining": "Book remaining {{value}}",
+    "credit_stale_count": "{{count}} cached values may be stale; refresh",
+    "credit_stale": "Cached or refresh failed",
+    "credit_expired": "Billing period ended; refresh",
     "title": "Notion AI plan usage",
     "rolling": "Rolling ({{window}})",
     "monthly": "Monthly",
@@ -84,6 +93,8 @@
     "unavailable": "Plan usage unavailable. Refresh quota to retry.",
     "note": "Rolling/monthly plan usage is measured separately from compatibility Basic/Premium metrics. Values reflect the last successful check."
   },
+  "model_test": {"choose":"Select model to test", "no_models":"No models available", "button":"Test model", "running":"Testing…", "success":"Success · {{seconds}} s", "failed":"Test failed; check sign-in, quota and connection", "cost_note":"Testing calls this account and consumes credits; usage depends on the model.", "reason_timeout":"Test timed out", "reason_cancelled":"Test cancelled", "reason_quota_exhausted":"Credits exhausted", "reason_model_unavailable":"Model unavailable", "reason_empty_response":"Model returned empty content", "reason_authentication_failed":"Login expired", "reason_permission_denied":"No permission for this model or workspace", "reason_rate_limited":"Rate limited; retry later", "reason_upstream_error":"Upstream error", "reason_network_error":"Network error", "reason_inference_failed":"Model call failed", "reason_test_busy":"A test is already running"},
+  "group_keys": {"title":"Account groups and scoped keys", "note":"The existing key retains access to all accounts. Scoped keys can only use accounts in their group; an empty group permits no accounts.", "groups":"Account groups", "keys":"Scoped API keys", "edit":"Edit", "delete":"Delete", "revoke":"Revoke", "group_name":"Group name", "key_name":"Key name", "save_group":"Save group", "new_group":"New group", "choose_group":"Choose group", "create_key":"Create key", "save_key":"Save key settings", "new_key":"Create new key", "secret_once":"Copy and save this key now; it cannot be shown again.", "close_secret":"Close", "delete_group_confirm":"Deleting this group also revokes all its keys. Continue?", "delete_key_confirm":"Revoke this key?", "failed":"Operation failed. Check the name, accounts and connection and retry.", "latency":"Prefer lower latency (successful samples only)", "missing_account":"Account no longer exists: {{id}}", "remove_missing":"Uncheck accounts that no longer exist before saving; they are not removed automatically."},
   "auth": {
     "prompt": "Enter admin key to access Dashboard",
     "placeholder": "Admin Key",
@@ -364,6 +375,7 @@
     "mode": "Routing mode",
     "mode_quota": "Quota first (rotate ties)",
     "mode_round_robin": "Pool round robin",
+    "mode_latency": "Prefer lower latency",
     "max_attempts": "Attempts per request",
     "max_concurrent_per_account": "Concurrency per account",
     "retention_days": "Request log retention (days)",

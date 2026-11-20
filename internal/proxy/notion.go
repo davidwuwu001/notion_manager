@@ -1363,6 +1363,10 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 		opt.UseReadOnlyMode = true
 	}
 
+	if IsAutoModel(model) {
+		return callAgentThreadInference(acc, messages, cb, &opt)
+	}
+
 	isResearcher := opt.IsResearcher || IsResearcherModel(model)
 
 	if isResearcher {
@@ -1479,6 +1483,7 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 		return fmt.Errorf("send request: %w", err)
 	}
 	defer resp.Body.Close()
+	probeFromContext(opt.Context).recordUpstream(resp.StatusCode, false, 0, false)
 	LogNotionResponseJSON(requestID, "POST /runInferenceTranscript response meta", map[string]interface{}{
 		"status":           resp.StatusCode,
 		"content_type":     resp.Header.Get("Content-Type"),
@@ -1501,7 +1506,7 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 	}
 
 	// Parse NDJSON
-	return parseNDJSONStream(reader, requestID, cb, opt.NativeToolUses, opt.ThinkingBlocks, opt.ThinkingCallback, opt.KnownCitationURLs, opt.KnownCitationDocs, opt.KnownToolCallURLs)
+	return parseNDJSONStream(reader, requestID, cb, opt.NativeToolUses, opt.ThinkingBlocks, opt.ThinkingCallback, opt.KnownCitationURLs, opt.KnownCitationDocs, opt.KnownToolCallURLs, probeFromContext(opt.Context))
 }
 
 func applyWorkflowRequestProtocol(reqBody *NotionInferenceRequest, createdSource string) {
@@ -2090,11 +2095,61 @@ func checkCreditRateLimit(acc *Account, client *http.Client) (*CreditRateLimit, 
 	if resp.StatusCode != http.StatusOK {
 		return nil, quotaHTTPError(resp.StatusCode)
 	}
-	var result CreditRateLimit
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	var raw json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return nil, err
 	}
-	if result.Window.Limit <= 0 && result.BillingPeriodWindow.Limit <= 0 {
+	var result CreditRateLimit
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, err
+	}
+	// These fields are our normalized output, never accepted directly from an upstream response.
+	result.Standard, result.Select = nil, nil
+	var buckets struct {
+		Allowances []struct {
+			BucketID    string `json:"bucketId"`
+			Cadence     string `json:"cadence"`
+			State       string `json:"state"`
+			PeriodEndMs int64  `json:"periodEndMs"`
+			Credits     struct {
+				Used  *float64 `json:"used"`
+				Limit *float64 `json:"limit"`
+			} `json:"credits"`
+		} `json:"allowances"`
+	}
+	if err := json.Unmarshal(raw, &buckets); err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	duplicates := map[string]bool{}
+	for _, b := range buckets.Allowances {
+		if (b.BucketID != "auto" && b.BucketID != "flex") || b.Cadence != "billing_period" {
+			continue
+		}
+		if seen[b.BucketID] {
+			duplicates[b.BucketID] = true
+			if b.BucketID == "auto" {
+				result.Standard = nil
+			} else {
+				result.Select = nil
+			}
+			continue
+		}
+		seen[b.BucketID] = true
+		if duplicates[b.BucketID] || b.State != "resolved" {
+			continue
+		}
+		if b.Credits.Used == nil || b.Credits.Limit == nil || *b.Credits.Used < 0 || *b.Credits.Limit < 0 {
+			continue
+		}
+		bucket := &CreditBucket{Used: *b.Credits.Used, Limit: *b.Credits.Limit, PeriodEndMs: b.PeriodEndMs}
+		if b.BucketID == "auto" {
+			result.Standard = bucket
+		} else {
+			result.Select = bucket
+		}
+	}
+	if result.Window.Limit <= 0 && result.BillingPeriodWindow.Limit <= 0 && result.Standard == nil && result.Select == nil {
 		return nil, quotaReadError("invalid_response")
 	}
 	if result.ResetsInSeconds > 0 {
@@ -2597,13 +2652,18 @@ func collectSearchResultCitationDocs(evt searchToolResultEvent) []CitationCandid
 	return docs
 }
 
-func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, nativeToolUses *[]AgentValueEntry, thinkingBlocks *[]ThinkingBlock, thinkingCb ThinkingDeltaCallback, knownCitationURLs *[]string, knownCitationDocs *[]CitationCandidate, knownToolCallURLs *map[string][]string) error {
+func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, nativeToolUses *[]AgentValueEntry, thinkingBlocks *[]ThinkingBlock, thinkingCb ThinkingDeltaCallback, knownCitationURLs *[]string, knownCitationDocs *[]CitationCandidate, knownToolCallURLs *map[string][]string, probes ...*bridgeProbe) (resultErr error) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	responseLogger := newNotionResponseLogDeduper(requestID, "runInferenceTranscript ndjson deduped")
 
 	var rawText string   // raw accumulated text from Notion
 	var sentClean string // cleaned text already emitted to callback
+	var streamRewriteError error
+	agentStepsOpen := make(map[string]bool)
+	patchStepsOpen := make(map[string]bool)
+	patchInvalidFinishes := make(map[string]bool)
+	patchSynchronized := false
 	lineCount := 0
 	eventTypeCounts := make(map[string]int)
 	emittedThinkingChars := 0
@@ -2655,8 +2715,53 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 	}
 	agentThinking := make(map[string]*agentThinkingState)
 	searchToolStates := make(map[string]*searchToolState)
+	agentTextBase := make(map[string]string)
+	agentTextContent := make(map[string]string)
+	lastTextAgent := ""
+	hasTextAgent := false
 	// Deduplicate native tool_use forwarding across cumulative agent-inference events.
 	seenNativeToolUseIDs := make(map[string]bool)
+	if len(probes) > 0 && probes[0] != nil {
+		defer func() {
+			terminal := patchSynchronized
+			for _, open := range agentStepsOpen {
+				if !open {
+					terminal = true
+				}
+			}
+			for _, open := range patchStepsOpen {
+				if !open {
+					terminal = true
+				}
+			}
+			probes[0].recordUpstream(0, sentClean != "", len(seenNativeToolUseIDs), terminal && resultErr == nil)
+		}()
+	}
+	nativeToolUseIndexes := make(map[string]int)
+	var nativeToolError error
+	collectNativeTool := func(entry AgentValueEntry) {
+		if entry.Name == "" || entry.ID == "" {
+			return
+		}
+		if seenNativeToolUseIDs[entry.ID] {
+			if nativeToolUses != nil {
+				idx := nativeToolUseIndexes[entry.ID]
+				if (*nativeToolUses)[idx].Name != entry.Name {
+					nativeToolError = errors.New("upstream reused tool call ID for different tool")
+					return
+				}
+				if len(entry.Input) > 0 && json.Valid(entry.Input) {
+					(*nativeToolUses)[idx].Input = append(json.RawMessage(nil), entry.Input...)
+				}
+			}
+			return
+		}
+		seenNativeToolUseIDs[entry.ID] = true
+		if nativeToolUses != nil {
+			nativeToolUseIndexes[entry.ID] = len(*nativeToolUses)
+			*nativeToolUses = append(*nativeToolUses, entry)
+		}
+	}
 	// toolCallId -> ordered web result URLs (for resolving [^toolu_*] citations).
 	toolCallSearchURLs := make(map[string][]string)
 	if knownToolCallURLs != nil {
@@ -2706,14 +2811,13 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 			return
 		}
 
-		start := 0
-		if strings.HasPrefix(cleaned, sentClean) {
-			start = len(sentClean)
-		} else {
-			// Rare patch rewrites can change earlier text. Use a rune-safe
-			// common prefix to avoid slicing in the middle of UTF-8 bytes.
-			start = longestCommonPrefixUTF8(cleaned, sentClean)
+		if !strings.HasPrefix(cleaned, sentClean) {
+			// Streaming protocols cannot retract bytes already delivered.  A
+			// common-prefix suffix would silently append a contradictory answer.
+			streamRewriteError = errors.New("upstream rewrote already emitted response")
+			return
 		}
+		start := len(sentClean)
 		if start < len(cleaned) {
 			closeThinking()
 			cb(cleaned[start:], false, nil)
@@ -2743,12 +2847,7 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 			}
 		case "tool_use":
 			// Skip — tool state must not pollute text output.
-			if entry.Name != "" && entry.ID != "" && !seenNativeToolUseIDs[entry.ID] {
-				seenNativeToolUseIDs[entry.ID] = true
-				if nativeToolUses != nil {
-					*nativeToolUses = append(*nativeToolUses, entry)
-				}
-			}
+			collectNativeTool(entry)
 		}
 	}
 
@@ -2758,11 +2857,12 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 			continue
 		}
 		lineCount++
-		responseLogger.LogLine(line)
-
 		var event NDJSONEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			continue
+			return errors.New("invalid upstream stream event")
+		}
+		if event.Type != "error" {
+			responseLogger.LogLine(line)
 		}
 		eventTypeCounts[event.Type]++
 
@@ -2902,10 +3002,14 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 			}
 
 		case "agent-inference":
+			patchSynchronized = false
 			var step AgentInferenceEvent
 			if err := json.Unmarshal([]byte(line), &step); err != nil {
-				continue
+				return errors.New("invalid upstream agent inference event")
 			}
+			agentStepsOpen[step.ID] = step.FinishedAt == nil || *step.FinishedAt <= 0
+			var stepText strings.Builder
+			hasStepText := false
 			for _, entry := range step.Value {
 				switch entry.Type {
 				case "thinking":
@@ -2925,14 +3029,8 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 						}
 					}
 				case "text":
-					newContent := entry.Content
-					// agent-inference text is cumulative, but Notion can rewrite earlier
-					// citation bytes (for example a partial URL becomes view://...), which
-					// makes the raw text shorter while still being newer content.
-					if cleanAllLangTags(newContent) != cleanAllLangTags(rawText) {
-						rawText = newContent
-						emitDelta()
-					}
+					hasStepText = true
+					stepText.WriteString(entry.Content)
 				case "tool_use":
 					// Detect search tool by name OR by input structure (handles
 					// Notion renaming the tool from "search" to "callFunction" etc.)
@@ -2962,15 +3060,27 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 							}
 						}
 					}
-					if entry.Name != "" && entry.ID != "" && !seenNativeToolUseIDs[entry.ID] {
-						seenNativeToolUseIDs[entry.ID] = true
-						if nativeToolUses != nil {
-							*nativeToolUses = append(*nativeToolUses, entry)
-						}
-					}
+					collectNativeTool(entry)
 				}
 			}
-			if step.FinishedAt != nil {
+			if hasStepText {
+				content := stepText.String()
+				base, known := agentTextBase[step.ID]
+				if !known {
+					base = rawText
+					agentTextBase[step.ID] = base
+					lastTextAgent, hasTextAgent = step.ID, true
+				} else if hasTextAgent && lastTextAgent != step.ID {
+					if content != agentTextContent[step.ID] {
+						return errors.New("upstream rewrote a previous response step")
+					}
+					continue
+				}
+				agentTextContent[step.ID] = content
+				rawText = base + content
+				emitDelta()
+			}
+			if step.FinishedAt != nil && *step.FinishedAt > 0 {
 				// Finalize thinking block for this step (only the latest cumulative content)
 				if thinkingBlocks != nil {
 					if ts, ok := agentThinking[step.ID]; ok && ts.content != "" {
@@ -2986,6 +3096,12 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 				}
 				// Final emit to flush any remaining text
 				emitDelta()
+				if streamRewriteError != nil {
+					return streamRewriteError
+				}
+				if nativeToolError != nil {
+					return nativeToolError
+				}
 				// Accumulate token usage across turns
 				updateUsage("agent:"+step.ID, step.InputTokens, step.OutputTokens)
 				cb("", true, &totalUsage)
@@ -2999,12 +3115,37 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 			}
 			if json.Unmarshal([]byte(line), &patchStart) == nil {
 				patchNextStepIndex = len(patchStart.Data.Steps)
+				latestOpen := -1
+				for idx, rawStep := range patchStart.Data.Steps {
+					var step AgentInferenceEvent
+					if json.Unmarshal(rawStep, &step) == nil && step.Type == "agent-inference" && (step.FinishedAt == nil || *step.FinishedAt <= 0) {
+						latestOpen = idx
+					}
+				}
+				for idx, rawStep := range patchStart.Data.Steps {
+					var step AgentInferenceEvent
+					if json.Unmarshal(rawStep, &step) != nil || step.Type != "agent-inference" {
+						continue
+					}
+					statePrefix := fmt.Sprintf("/s/%d", idx)
+					patchStepsOpen[statePrefix] = step.FinishedAt == nil || *step.FinishedAt <= 0
+					patchValueCounts[statePrefix] = len(step.Value)
+					for valueIndex, entry := range step.Value {
+						patchValueTypes[fmt.Sprintf("%s/value/%d", statePrefix, valueIndex)] = entry.Type
+						if idx == latestOpen {
+							handlePatchValueEntry(statePrefix, valueIndex, entry)
+						}
+					}
+				}
+			} else {
+				return errors.New("invalid upstream patch-start event")
 			}
 
 		case "patch":
+			patchSynchronized = false
 			var patch PatchEvent
 			if err := json.Unmarshal([]byte(line), &patch); err != nil {
-				continue
+				return errors.New("invalid upstream patch event")
 			}
 			for _, op := range patch.V {
 				if op.O == "a" && op.P == "/s/-" {
@@ -3014,6 +3155,7 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 					var step AgentInferenceEvent
 					if json.Unmarshal(op.V, &step) == nil && step.Type == "agent-inference" {
 						statePrefix := fmt.Sprintf("/s/%d", stepIndex)
+						patchStepsOpen[statePrefix] = step.FinishedAt == nil || *step.FinishedAt <= 0
 						for idx, entry := range step.Value {
 							handlePatchValueEntry(statePrefix, idx, entry)
 						}
@@ -3041,7 +3183,16 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 				}
 
 				// Handle finishedAt for thinking → flush thinking block
-				if op.O == "a" && strings.HasSuffix(op.P, "/finishedAt") {
+				if (op.O == "a" || op.O == "r") && strings.HasSuffix(op.P, "/finishedAt") {
+					statePrefix := strings.TrimSuffix(op.P, "/finishedAt")
+					var finishedAt *int64
+					if json.Unmarshal(op.V, &finishedAt) != nil || finishedAt == nil || *finishedAt <= 0 {
+						patchStepsOpen[statePrefix] = true
+						patchInvalidFinishes[statePrefix] = true
+						continue
+					}
+					patchStepsOpen[statePrefix] = false
+					delete(patchInvalidFinishes, statePrefix)
 					if patchThinkingContent != "" {
 						if thinkingBlocks != nil {
 							*thinkingBlocks = append(*thinkingBlocks, ThinkingBlock{
@@ -3106,21 +3257,43 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 				}
 			}
 
+		case "patch-sync":
+			patchSynchronized = true
+
 		case "error":
-			var errEvt struct {
-				Message string `json:"message"`
-			}
-			json.Unmarshal([]byte(line), &errEvt)
 			LogNotionResponseJSON(requestID, "runInferenceTranscript stream error event", map[string]interface{}{
 				"line_count": lineCount,
-				"message":    errEvt.Message,
+				"error":      "upstream_stream_error",
 			})
-			return fmt.Errorf("notion error: %s", errEvt.Message)
+			return errors.New("upstream stream error")
+		}
+		if streamRewriteError != nil {
+			return streamRewriteError
+		}
+		if nativeToolError != nil {
+			return nativeToolError
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
 		return err
+	}
+	for _, open := range agentStepsOpen {
+		if open {
+			return io.ErrUnexpectedEOF
+		}
+	}
+	for _, invalid := range patchInvalidFinishes {
+		if invalid {
+			return io.ErrUnexpectedEOF
+		}
+	}
+	if !patchSynchronized {
+		for _, open := range patchStepsOpen {
+			if open {
+				return io.ErrUnexpectedEOF
+			}
+		}
 	}
 
 	closeThinking()

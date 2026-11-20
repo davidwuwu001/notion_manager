@@ -3,6 +3,7 @@ import { fetchAnalytics, fetchDashboardData, fetchRequestLogs, fetchRouting, fet
 import { confirmedPremiumBalance, emptyLogFilters, metricValue, routingMetrics, timestampValue } from '../dashboard'
 import { buttonClass, Coverage, Metric, Panel, RequestMetrics, RequestTimeline, ResourceState, useAdminResource } from './DashboardShared'
 import { SystemStatusBar } from './SystemStatusBar'
+import type { AccountSummary } from '../types'
 
 export function OverviewPanel() {
   const { t } = useTranslation()
@@ -12,10 +13,13 @@ export function OverviewPanel() {
   const logs = useAdminResource(signal => fetchRequestLogs(emptyLogFilters, '', 8, signal), [], 15000)
   const history = useAdminResource(fetchTokenStats, [], 15000)
   const availability = routingMetrics(routing.data)
+  const creditNumber = (value: number) => value.toLocaleString(undefined, { maximumFractionDigits: 6 })
+  const credit = (bucket: AccountSummary['standard_credits']) => bucket?.known ? <>{creditNumber(bucket.used)} / {creditNumber(bucket.limit)}<div className="text-xs font-normal text-text-secondary mt-2">{t('ai_usage.remaining', { value: creditNumber(bucket.remaining) })} · {t('ai_usage.credit_known', { known: bucket.known, unknown: bucket.unknown })}{bucket.stale > 0 ? ` · ${t('ai_usage.credit_stale_count', { count: bucket.stale })}` : ''}</div></> : <>{t('ai_usage.credit_unknown')}<div className="text-xs font-normal text-text-secondary mt-2">{t('ai_usage.credit_known', { known: bucket?.known ?? 0, unknown: bucket?.unknown ?? 0 })}</div></>
   return <div className="space-y-5">
     <h1 className="text-xl font-semibold">{t('upgrade.overview')}</h1>
     <SystemStatusBar />
     <ResourceState {...pool} retry={pool.reload} />
+    {pool.data?.summary && <Panel title={t('ai_usage.credit_summary')}><div className="grid gap-3 sm:grid-cols-2"><Metric title={t('ai_usage.standard')} value={credit(pool.data.summary.standard_credits)} /><Metric title={t('ai_usage.select')} value={credit(pool.data.summary.select_credits)} /></div></Panel>}
     {pool.data && <><div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><Metric title={t('stats.total_accounts')} value={pool.data.total} /><Metric title={`${t('upgrade.pool')} · ${t('stats.available')}`} value={metricValue(availability.available)} /><Metric title={t('stats.basic_remaining')} value={metricValue(pool.data.summary?.total_remaining)} /><Metric title={t('stats.premium_remaining')} value={<>{metricValue(confirmedPremiumBalance(pool.data.summary?.total_premium_balance, pool.data.summary?.premium_unknown_accounts != null))}<div className="text-[12px] font-normal text-text-secondary mt-2">{t('quota.unknown_accounts', { count: metricValue(pool.data.summary?.premium_unknown_accounts) })}</div></>} /></div><p className="text-[12px] text-text-secondary">{t('quota.compatibility_note')}</p></>}
     <ResourceState {...routing} retry={routing.reload} />
     {routing.data && <Panel title={t('upgrade.pool')}><p className="text-sm">{t('upgrade.pool_summary', routing.data as unknown as Record<string, unknown>)}</p><p className="text-[12px] text-text-secondary mt-2">{t(`upgrade.mode_${routing.data.mode}`)}</p></Panel>}

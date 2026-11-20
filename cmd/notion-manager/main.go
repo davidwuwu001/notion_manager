@@ -163,6 +163,10 @@ func requiresAPIKey(path string) bool {
 }
 
 func apiKeyAuthMiddleware(apiKey string, next http.Handler) http.Handler {
+	return apiKeyAuthMiddlewareWithAccess(apiKey, nil, next)
+}
+
+func apiKeyAuthMiddlewareWithAccess(apiKey string, access *proxy.AccessStore, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !requiresAPIKey(r.URL.Path) {
 			next.ServeHTTP(w, r)
@@ -184,6 +188,13 @@ func apiKeyAuthMiddleware(apiKey string, next http.Handler) http.Handler {
 			return
 		}
 		if key != apiKey {
+			if access != nil {
+				if scope, ctx, done, ok := access.AuthorizeRequest(r.Context(), key); ok {
+					defer done()
+					next.ServeHTTP(w, r.WithContext(proxy.WithAccessScope(ctx, scope)))
+					return
+				}
+			}
 			http.Error(w, `{"error":{"message":"invalid api key","type":"auth_error"}}`, http.StatusUnauthorized)
 			return
 		}
@@ -212,6 +223,7 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	// Admin API endpoints
 	mux.HandleFunc("/admin/accounts", proxy.HandleAdminAccounts(pool, dashAuth))
 	mux.HandleFunc("/admin/accounts/add", proxy.HandleAddAccount(pool, accountsDir, dashAuth))
+	mux.HandleFunc("/admin/accounts/test", proxy.HandleAccountModelTest(pool, dashAuth))
 	mux.HandleFunc("/admin/accounts/delete", proxy.HandleDeleteAccount(pool, accountsDir, dashAuth))
 	mux.HandleFunc("/admin/models", proxy.HandleAdminModels(pool, dashAuth))
 	mux.HandleFunc("/admin/refresh", proxy.HandleAdminRefresh(pool, accountsDir, dashAuth))
@@ -294,6 +306,10 @@ func main() {
 	tokenFile := cfg.Server.TokenFile
 
 	pool := proxy.NewAccountPool()
+	access, err := proxy.NewAccessStore(filepath.Join(accountsDir, ".access.json"))
+	if err != nil {
+		log.Fatalf("[access] failed to read access store: %v", err)
+	}
 	if err := pool.ConfigureRouting(filepath.Join(accountsDir, ".routing.json")); err != nil {
 		log.Fatalf("[routing] %v", err)
 	}
@@ -365,6 +381,7 @@ func main() {
 	}
 
 	mux := newMux(pool, accountsDir, apiKey, dashAuth, usageStats, regDeps, requestLogs)
+	mux.HandleFunc("/admin/access", proxy.HandleAdminAccess(access, pool, dashAuth))
 
 	log.Printf("=== notion-manager ===")
 	log.Printf("Listening on 127.0.0.1:%s", port)
@@ -389,7 +406,7 @@ func main() {
 	log.Printf("  GET  /admin/register/jobs/{id}/events (SSE progress)")
 	log.Printf("  GET  /ai                          (Reverse Proxy -> notion.so)")
 
-	server := &http.Server{Addr: "127.0.0.1:" + port, Handler: cors(proxy.RequestLogMiddleware(requestLogs, apiKeyAuthMiddleware(apiKey, mux))), ReadHeaderTimeout: 10 * time.Second}
+	server := &http.Server{Addr: "127.0.0.1:" + port, Handler: proxy.BridgeProbeHandler(cors(proxy.RequestLogMiddleware(requestLogs, apiKeyAuthMiddlewareWithAccess(apiKey, access, mux)))), ReadHeaderTimeout: 10 * time.Second}
 	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	shutdownDone := make(chan struct{})

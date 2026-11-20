@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"math"
 	"sort"
 	"strings"
+	"time"
 )
 
 // AccountSummary aggregates pool-wide counts and quota sums used by the
@@ -12,29 +14,93 @@ import (
 //
 // JSON tags use snake_case to match the rest of the admin API.
 type AccountSummary struct {
-	ExhaustedOnly          int   `json:"exhausted_only"`
-	NoWorkspace            int   `json:"no_workspace"`
-	PremiumAccounts        int   `json:"premium_accounts"`
-	ResearchLimited        int   `json:"research_limited"`
-	TotalResearchUsage     int   `json:"total_research_usage"`
-	TotalRemaining         int   `json:"total_remaining"`
-	TotalSpaceUsage        int   `json:"total_space_usage"`
-	TotalSpaceLimit        int   `json:"total_space_limit"`
-	TotalSpaceRemaining    int   `json:"total_space_remaining"`
-	TotalUserUsage         int   `json:"total_user_usage"`
-	TotalUserLimit         int   `json:"total_user_limit"`
-	TotalUserRemaining     int   `json:"total_user_remaining"`
-	TotalPremiumBalance    int64 `json:"total_premium_balance"`
-	TotalPremiumLimit      int64 `json:"total_premium_limit"`
-	PremiumUnknownAccounts int   `json:"premium_unknown_accounts"`
+	StandardCredits        CreditBucketSummary `json:"standard_credits"`
+	SelectCredits          CreditBucketSummary `json:"select_credits"`
+	ExhaustedOnly          int                 `json:"exhausted_only"`
+	NoWorkspace            int                 `json:"no_workspace"`
+	PremiumAccounts        int                 `json:"premium_accounts"`
+	ResearchLimited        int                 `json:"research_limited"`
+	TotalResearchUsage     int                 `json:"total_research_usage"`
+	TotalRemaining         int                 `json:"total_remaining"`
+	TotalSpaceUsage        int                 `json:"total_space_usage"`
+	TotalSpaceLimit        int                 `json:"total_space_limit"`
+	TotalSpaceRemaining    int                 `json:"total_space_remaining"`
+	TotalUserUsage         int                 `json:"total_user_usage"`
+	TotalUserLimit         int                 `json:"total_user_limit"`
+	TotalUserRemaining     int                 `json:"total_user_remaining"`
+	TotalPremiumBalance    int64               `json:"total_premium_balance"`
+	TotalPremiumLimit      int64               `json:"total_premium_limit"`
+	PremiumUnknownAccounts int                 `json:"premium_unknown_accounts"`
+}
+
+type CreditBucketSummary struct {
+	Used      float64 `json:"used"`
+	Limit     float64 `json:"limit"`
+	Remaining float64 `json:"remaining"`
+	Known     int     `json:"known"`
+	Unknown   int     `json:"unknown"`
+	Stale     int     `json:"stale"`
+}
+
+func creditBucketStatus(bucket *CreditBucket, status QuotaSourceStatus, checkedAt time.Time, now time.Time) string {
+	if bucket == nil || math.IsNaN(bucket.Used) || math.IsNaN(bucket.Limit) || math.IsInf(bucket.Used, 0) || math.IsInf(bucket.Limit, 0) || bucket.Used < 0 || bucket.Limit < 0 {
+		return "unknown"
+	}
+	if bucket.PeriodEndMs > 0 && bucket.PeriodEndMs <= now.UnixMilli() {
+		return "expired"
+	}
+	succeeded := time.Time{}
+	if status.SucceededAtMs > 0 {
+		succeeded = time.UnixMilli(status.SucceededAtMs)
+	} else if !checkedAt.IsZero() {
+		succeeded = checkedAt
+	}
+	if succeeded.IsZero() {
+		return "unknown"
+	}
+	if status.Error != "" || (status.CheckedAtMs > 0 && status.CheckedAtMs != status.SucceededAtMs) || now.Sub(succeeded) > 24*time.Hour || succeeded.After(now.Add(5*time.Minute)) || bucket.PeriodEndMs <= 0 || status.SucceededAtMs == 0 {
+		return "stale"
+	}
+	return "current"
+}
+
+func (s *CreditBucketSummary) add(bucket *CreditBucket, status string) {
+	if status == "unknown" || status == "expired" {
+		s.Unknown++
+		return
+	}
+	s.Known++
+	if status == "stale" {
+		s.Stale++
+	}
+	s.Used += bucket.Used
+	s.Limit += bucket.Limit
+	s.Remaining += math.Max(0, bucket.Limit-bucket.Used)
 }
 
 // summarizeAccounts walks the full account-detail list and produces the
 // summary used by the dashboard headline cards. It treats missing fields
 // as zero.
 func summarizeAccounts(accounts []map[string]interface{}) AccountSummary {
+	return summarizeAccountsAt(accounts, time.Now())
+}
+func summarizeAccountsAt(accounts []map[string]interface{}, now time.Time) AccountSummary {
 	var s AccountSummary
 	for _, a := range accounts {
+		var standard, selectBucket *CreditBucket
+		if rate, ok := a["rate_limit"].(*CreditRateLimit); ok && rate != nil {
+			standard, selectBucket = rate.Standard, rate.Select
+		}
+		var source QuotaSourceStatus
+		if sources, ok := a["quota_sources"].(map[string]QuotaSourceStatus); ok {
+			source = sources["allowance"]
+		}
+		var checkedAt time.Time
+		if value, ok := a["checked_at"].(string); ok {
+			checkedAt, _ = time.Parse(time.RFC3339, value)
+		}
+		s.StandardCredits.add(standard, creditBucketStatus(standard, source, checkedAt, now))
+		s.SelectCredits.add(selectBucket, creditBucketStatus(selectBucket, source, checkedAt, now))
 		exh := mapBool(a, "exhausted")
 		perm := mapBool(a, "permanent")
 		nws := mapBool(a, "no_workspace")

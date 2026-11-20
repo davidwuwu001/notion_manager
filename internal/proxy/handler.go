@@ -63,9 +63,15 @@ func HandlePublicModels(pool *AccountPool) http.HandlerFunc {
 			return
 		}
 
+		var models []ModelEntry
+		if scope := AccessScopeFromContext(r.Context()); scope != nil {
+			models = pool.ScopedModels(scope.Allowed)
+		} else {
+			models = pool.AllModels()
+		}
 		resp := publicModelResponse{
 			Object: "list",
-			Data:   buildPublicModels(pool.AllModels()),
+			Data:   buildPublicModels(models),
 		}
 		json.NewEncoder(w).Encode(resp)
 	}

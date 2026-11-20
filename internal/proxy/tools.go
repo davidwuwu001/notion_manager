@@ -23,6 +23,11 @@ const (
 
 func detectModelFamily(model string) modelFamily {
 	m := strings.ToLower(model)
+	// Auto is routed through the Claude-compatible tool bridge because
+	// Claude Code is the primary caller that sends native Anthropic tools.
+	if strings.EqualFold(strings.TrimSpace(model), "auto") {
+		return familyAnthropic
+	}
 	// Notion's opaque IDs (e.g. avocado-froyo-medium) use configured aliases.
 	for name, id := range SnapshotModelMap() {
 		if strings.EqualFold(id, model) && !strings.EqualFold(name, id) {
@@ -844,9 +849,9 @@ func parseToolCalls(content string) ([]ToolCall, string, bool) {
 	// Method 1: <tool_call>{...}</tool_call> XML format (preferred)
 	xmlMatches := toolCallXMLRegex.FindAllStringSubmatch(content, -1)
 	for i, match := range xmlMatches {
-		remaining = strings.Replace(remaining, match[0], "", 1)
 		tc := parseToolCallJSON(match[1], i)
 		if tc != nil {
+			remaining = strings.Replace(remaining, match[0], "", 1)
 			toolCalls = append(toolCalls, *tc)
 		}
 	}
@@ -873,48 +878,16 @@ func parseToolCalls(content string) ([]ToolCall, string, bool) {
 	remaining = content
 	stripped := strings.TrimSpace(content)
 
-	// Try direct {"name": "...", "arguments": {...}} format
-	var direct struct {
-		Name      string          `json:"name"`
-		Arguments json.RawMessage `json:"arguments"`
+	if tc := parseToolCallJSON(stripped, 0); tc != nil {
+		return []ToolCall{*tc}, "", true
 	}
-	if err := json.Unmarshal([]byte(stripped), &direct); err == nil && direct.Name != "" {
-		argsStr := string(direct.Arguments)
-		if !json.Valid(direct.Arguments) {
-			argsStr = "{}"
+	var wrapper map[string]json.RawMessage
+	if json.Unmarshal([]byte(stripped), &wrapper) == nil {
+		if nested, ok := wrapper["tool_call"]; ok {
+			if tc := parseToolCallJSON(string(nested), 0); tc != nil {
+				return []ToolCall{*tc}, "", true
+			}
 		}
-		toolCalls = append(toolCalls, ToolCall{
-			ID:   fmt.Sprintf("call_0_%s", generateUUIDv4()[:8]),
-			Type: "function",
-			Function: ToolCallFunction{
-				Name:      direct.Name,
-				Arguments: argsStr,
-			},
-		})
-		return toolCalls, "", true
-	}
-
-	// Try {"tool_call": {...}} wrapper format
-	var wrapper struct {
-		ToolCall *struct {
-			Name      string          `json:"name"`
-			Arguments json.RawMessage `json:"arguments"`
-		} `json:"tool_call"`
-	}
-	if err := json.Unmarshal([]byte(stripped), &wrapper); err == nil && wrapper.ToolCall != nil {
-		argsStr := string(wrapper.ToolCall.Arguments)
-		if !json.Valid(wrapper.ToolCall.Arguments) {
-			argsStr = "{}"
-		}
-		toolCalls = append(toolCalls, ToolCall{
-			ID:   fmt.Sprintf("call_0_%s", generateUUIDv4()[:8]),
-			Type: "function",
-			Function: ToolCallFunction{
-				Name:      wrapper.ToolCall.Name,
-				Arguments: argsStr,
-			},
-		})
-		return toolCalls, "", true
 	}
 
 	// Method 3: multi-line JSON — each line is a separate {"name":"...", "arguments":{...}}
@@ -927,23 +900,8 @@ func parseToolCalls(content string) ([]ToolCall, string, bool) {
 		if line == "" {
 			continue
 		}
-		var lineCall struct {
-			Name      string          `json:"name"`
-			Arguments json.RawMessage `json:"arguments"`
-		}
-		if err := json.Unmarshal([]byte(line), &lineCall); err == nil && lineCall.Name != "" {
-			argsStr := string(lineCall.Arguments)
-			if !json.Valid(lineCall.Arguments) {
-				argsStr = "{}"
-			}
-			multiCalls = append(multiCalls, ToolCall{
-				ID:   fmt.Sprintf("call_%d_%s", len(multiCalls), generateUUIDv4()[:8]),
-				Type: "function",
-				Function: ToolCallFunction{
-					Name:      lineCall.Name,
-					Arguments: argsStr,
-				},
-			})
+		if tc := parseToolCallJSON(line, len(multiCalls)); tc != nil {
+			multiCalls = append(multiCalls, *tc)
 		} else {
 			nonToolLines = append(nonToolLines, line)
 		}
@@ -956,22 +914,17 @@ func parseToolCalls(content string) ([]ToolCall, string, bool) {
 }
 
 func parseToolCallJSON(jsonStr string, index int) *ToolCall {
-	var call struct {
-		Name      string          `json:"name"`
-		Arguments json.RawMessage `json:"arguments"`
-	}
-	if err := json.Unmarshal([]byte(jsonStr), &call); err != nil {
+	var call map[string]json.RawMessage
+	var name string
+	if json.Unmarshal([]byte(jsonStr), &call) != nil || json.Unmarshal(call["name"], &name) != nil || strings.TrimSpace(name) == "" || !json.Valid(call["arguments"]) {
 		return nil
 	}
-	argsStr := string(call.Arguments)
-	if !json.Valid(call.Arguments) {
-		argsStr = "{}"
-	}
+	argsStr := string(call["arguments"])
 	return &ToolCall{
 		ID:   fmt.Sprintf("call_%d_%s", index, generateUUIDv4()[:8]),
 		Type: "function",
 		Function: ToolCallFunction{
-			Name:      call.Name,
+			Name:      name,
 			Arguments: argsStr,
 		},
 	}

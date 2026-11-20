@@ -366,7 +366,7 @@ func TestConvertOpenAIResponsesRequestAcceptsNamespacedFunctionCallHistory(t *te
 	}
 }
 
-func TestConvertOpenAIResponsesRequestRejectsUnknownNamespacedFunctionCall(t *testing.T) {
+func TestConvertOpenAIResponsesRequestAcceptsHistoricalNamespacedFunctionCall(t *testing.T) {
 	req := &OpenAIResponsesRequest{
 		Model: "kimi-k3",
 		Tools: []OpenAITool{{
@@ -385,9 +385,13 @@ func TestConvertOpenAIResponsesRequestRejectsUnknownNamespacedFunctionCall(t *te
 		},
 	}
 
-	_, err := convertOpenAIResponsesRequest(req)
-	if err == nil || !strings.Contains(err.Error(), `unknown tool "run" in namespace "unknown"`) {
-		t.Fatalf("error = %v, want unknown namespaced function_call rejection", err)
+	converted, err := convertOpenAIResponsesRequest(req)
+	if err != nil {
+		t.Fatalf("historical call rejected: %v", err)
+	}
+	block := converted.Messages[0].Content.([]interface{})[0].(map[string]interface{})
+	if block["name"] == converted.Tools[0].Name {
+		t.Fatalf("history alias collides with current declaration: %#v", block)
 	}
 }
 

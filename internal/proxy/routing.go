@@ -48,6 +48,8 @@ type RoutingAccountStatus struct {
 	QuotaCheckedAtMs int64  `json:"quota_checked_at_ms,omitempty"`
 	CooldownUntilMs  int64  `json:"cooldown_until_ms,omitempty"`
 	InFlight         int    `json:"in_flight"`
+	LatencyMs        *int64 `json:"latency_ms,omitempty"`
+	LatencySamples   int    `json:"latency_samples,omitempty"`
 }
 
 type RoutingStatus struct {
@@ -64,6 +66,8 @@ type RoutingStatus struct {
 
 type routingRuntime struct {
 	inFlight            int
+	latencySeconds      float64
+	latencySamples      int
 	account             *Account
 	reason              string
 	until               time.Time
@@ -80,7 +84,7 @@ func normalizedRoutingConfig(config RoutingConfig) (RoutingConfig, error) {
 	if config.Mode == "" {
 		config.Mode = "quota"
 	}
-	if config.Mode != "quota" && config.Mode != "round_robin" {
+	if config.Mode != "quota" && config.Mode != "round_robin" && config.Mode != "latency" {
 		return config, fmt.Errorf("unsupported routing mode")
 	}
 	if config.MaxAttempts < 0 || config.MaxConcurrentPerAccount < 0 || config.RetentionDays < 0 || config.RetentionDays > 3650 {
@@ -122,7 +126,22 @@ func (p *AccountPool) UpdateRouting(config RoutingConfig) error {
 }
 
 func (p *AccountPool) SelectForRequest(model string, research bool, excluded map[string]bool, boundID string) (*Account, func(), error) {
+	return p.SelectForRequestScoped(model, research, excluded, boundID, nil)
+}
+
+// allowed is nil for the unrestricted master key; an empty map allows no accounts.
+func (p *AccountPool) SelectForRequestScoped(model string, research bool, excluded map[string]bool, boundID string, allowed map[string]bool) (*Account, func(), error) {
 	accounts := p.AccountsSnapshot()
+	if allowed != nil {
+		filtered := make([]*Account, 0, len(accounts))
+		for _, acc := range accounts {
+			acc.EnsureAccountID()
+			if allowed[acc.AccountID] {
+				filtered = append(filtered, acc)
+			}
+		}
+		accounts = filtered
+	}
 	p.recheckRoutingAccounts(accounts)
 	p.routingMu.Lock()
 	defer p.routingMu.Unlock()
@@ -132,8 +151,8 @@ func (p *AccountPool) SelectForRequest(model string, research bool, excluded map
 	}
 	budget := config.MaxAttempts
 	tried := 0
-	for _, value := range excluded {
-		if value {
+	for _, acc := range accounts {
+		if excluded[acc.AccountID] {
 			tried++
 		}
 	}
@@ -188,6 +207,14 @@ func (p *AccountPool) SelectForRequest(model string, research bool, excluded map
 		score, _ := routingQuotaScore(acc)
 		if config.Mode == "round_robin" {
 			score = 0
+		} else if config.Mode == "latency" {
+			if state.latencySamples == 0 {
+				// Give unmeasured accounts an 8-second prior on the same scale as
+				// measured responses; each in-flight request reduces their score.
+				score = 1 / (8 * float64(state.inFlight+1))
+			} else {
+				score = 1 / (math.Max(0.1, state.latencySeconds) * float64(state.inFlight+1))
+			}
 		} else if score >= 0 {
 			score /= float64(state.inFlight + 1)
 		}
@@ -211,6 +238,26 @@ func (p *AccountPool) SelectForRequest(model string, research bool, excluded map
 	var once sync.Once
 	release := func() { once.Do(func() { p.routingMu.Lock(); state.inFlight--; p.routingMu.Unlock() }) }
 	return best, release, nil
+}
+
+// RecordRoutingLatency records successful bounded EWMA samples, never failed calls.
+func (p *AccountPool) RecordRoutingLatency(acc *Account, elapsed time.Duration) {
+	seconds := elapsed.Seconds()
+	if acc == nil || seconds <= 0 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+		return
+	}
+	seconds = math.Max(0.1, math.Min(seconds, 120))
+	p.routingMu.Lock()
+	defer p.routingMu.Unlock()
+	state := p.routingStateLocked(acc)
+	if state.latencySamples == 0 {
+		state.latencySeconds = seconds
+	} else {
+		state.latencySeconds = 0.25*seconds + 0.75*state.latencySeconds
+	}
+	if state.latencySamples < 100 {
+		state.latencySamples++
+	}
 }
 
 func (p *AccountPool) routingStateLocked(acc *Account) *routingRuntime {
@@ -365,6 +412,9 @@ func routingSupportsModel(acc *Account, model string, research bool, state *rout
 	if model == "" {
 		return true
 	}
+	if IsAutoModel(model) {
+		return true
+	}
 	resolved := ResolveModel(model)
 	if state.models[resolved] {
 		return false
@@ -385,6 +435,11 @@ func (p *AccountPool) routingAccountStatusLocked(acc *Account, config RoutingCon
 	state := p.routingStateLocked(acc)
 	_, source := routingQuotaScore(acc)
 	status := RoutingAccountStatus{AccountID: acc.AccountID, Enabled: true, Status: "available", Reason: "", ScoreSource: source, InFlight: state.inFlight}
+	if state.latencySamples > 0 {
+		ms := int64(state.latencySeconds * 1000)
+		status.LatencyMs = &ms
+		status.LatencySamples = state.latencySamples
+	}
 	quota := acc.quotaSnapshot()
 	if quota.CheckedAt != nil {
 		status.QuotaCheckedAtMs = quota.CheckedAt.UnixMilli()

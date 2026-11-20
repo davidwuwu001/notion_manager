@@ -4,6 +4,7 @@ import type { DashboardData, AccountInfo, AccountSummary, RefreshStatus, TokenSt
 import { fetchDashboardData, openProxy, openBestProxy, checkAuth, login, logout, triggerRefresh, addAccount, fetchTokenStats, fetchRouting, updateRouting } from './api'
 import { fmt, formatTokens, getQuotaStatusByUsage, getQuotaPct, avatarColor, avatarLetter, formatCheckedAt, formatTimestampMs, providerDisplay } from './utils'
 import { AccountMenu } from './components/AccountMenu'
+import { AccountModelTest } from './components/AccountModelTest'
 import { LanguageToggle } from './components/LanguageToggle'
 import { ModelsPanel } from './components/ModelsPanel'
 import { parseAccountImport } from './account-import'
@@ -431,6 +432,8 @@ function OverviewBar({ label, usage, limit }: { label: string; usage: number; li
   )
 }
 
+function creditNumber(value: number) { return value.toLocaleString(undefined, { maximumFractionDigits: 6 }) }
+
 function TotalQuotaBar({ summary }: { summary?: AccountSummary | null }) {
   const { t } = useTranslation()
   const totalSpaceUsage = summary?.total_space_usage ?? 0
@@ -445,6 +448,15 @@ function TotalQuotaBar({ summary }: { summary?: AccountSummary | null }) {
 
   return (
     <div className="mb-5 space-y-3">
+      <div className="grid gap-3 sm:grid-cols-2" aria-label={t('ai_usage.credit_summary')}>
+        {([['standard', summary?.standard_credits], ['select', summary?.select_credits]] as const).map(([kind, value]) => <div key={kind} className="rounded-md border border-border bg-bg-card p-3 text-sm">
+          <div className="font-semibold">{t(`ai_usage.${kind}`)}</div>
+          <div className="mt-1 tabular-nums">{value?.known ? `${creditNumber(value.used)} / ${creditNumber(value.limit)}` : '—'}</div>
+          {value?.known ? <div className="text-xs text-text-secondary mt-1">{t('ai_usage.remaining', { value: creditNumber(value.remaining) })}</div> : null}
+          <div className="text-xs text-text-secondary mt-1">{t('ai_usage.credit_known', { known: value?.known ?? 0, unknown: value?.unknown ?? 0 })}</div>
+          {value?.stale ? <div role="status" className="text-xs text-warn mt-1">{t('ai_usage.credit_stale_count', { count: value.stale })}</div> : null}
+        </div>)}
+      </div>
       <div className="flex flex-wrap gap-3 justify-between items-center">
         <span className="text-[11px] text-text-secondary uppercase tracking-wider flex items-center gap-1.5"><IconBarChart /> {t('stats.basic_overview')}</span>
         {summary && (
@@ -469,13 +481,22 @@ function TotalQuotaBar({ summary }: { summary?: AccountSummary | null }) {
 function AIUsage({ account }: { account: AccountInfo }) {
   const { t } = useTranslation()
   const rate = account.rate_limit
-  const windows = rate ? [
+  const windows = rate && (rate.window.limit > 0 || rate.billingPeriodWindow.limit > 0) ? [
     { label: t('ai_usage.rolling', { window: rate.window.window }), used: rate.window.used, limit: rate.window.limit, reset: rate.rolling_reset_at_ms },
     { label: t('ai_usage.monthly'), used: rate.billingPeriodWindow.used, limit: rate.billingPeriodWindow.limit, reset: rate.billingPeriodWindow.periodEndMs },
   ] : []
   return (
     <section className="my-3 rounded-md border border-border bg-bg-card p-3" aria-label={t('ai_usage.title')}>
       <div className="text-[12px] font-semibold mb-2">{t('ai_usage.title')}</div>
+      <div className="grid grid-cols-2 gap-2 mb-2">
+        {([['standard', rate?.standard, account.credit_standard_status], ['select', rate?.select, account.credit_select_status]] as const).map(([kind, bucket, status]) => <div key={kind} className="text-[11px]">
+          <div>{t(`ai_usage.${kind}`)}</div>
+          <div className="tabular-nums">{bucket && (status === 'current' || status === 'stale') ? `${creditNumber(bucket.used)} / ${creditNumber(bucket.limit)}` : t('ai_usage.credit_unknown')}</div>
+          {status === 'stale' && <div role="status" className="text-warn">{t('ai_usage.credit_stale')}</div>}
+          {status === 'expired' && <div role="status" className="text-warn">{t('ai_usage.credit_expired')}</div>}
+          {bucket?.periodEndMs ? <div className="text-text-secondary">{t('ai_usage.resets', { date: new Date(bucket.periodEndMs).toLocaleString() })}</div> : null}
+        </div>)}
+      </div>
       {account.quota_sources && <div className="space-y-1 mb-2 text-[10px] text-text-secondary">
         {(['basic', 'premium', 'allowance'] as const).map(source => {
           const state = account.quota_sources?.[source]
@@ -610,6 +631,7 @@ function AccountCard({ account, onChanged, routing, onToggle, toggling }: { acco
       </div>
 
       {/* Badges */}
+      <AccountModelTest account={account} />
       {account.space_id && <div className="flex items-center gap-2 text-[11px] text-text-secondary mb-2">
         <span>{t('account.workspace_id')}</span>
         <code className="truncate select-all" title={account.space_id}>{account.space_id}</code>

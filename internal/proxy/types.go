@@ -79,8 +79,10 @@ type QuotaSourceStatus struct {
 
 // CreditRateLimit is the allowance shown in Notion's AI Usage settings, separate from premium credits.
 type CreditRateLimit struct {
-	Status string `json:"status"`
-	Window struct {
+	Status   string        `json:"status"`
+	Standard *CreditBucket `json:"standard,omitempty"`
+	Select   *CreditBucket `json:"select,omitempty"`
+	Window   struct {
 		Used   float64 `json:"used"`
 		Limit  float64 `json:"limit"`
 		Window string  `json:"window"`
@@ -92,6 +94,12 @@ type CreditRateLimit struct {
 		Limit       float64 `json:"limit"`
 		PeriodEndMs int64   `json:"periodEndMs"`
 	} `json:"billingPeriodWindow"`
+}
+
+type CreditBucket struct {
+	Used        float64 `json:"used"`
+	Limit       float64 `json:"limit"`
+	PeriodEndMs int64   `json:"periodEndMs,omitempty"`
 }
 
 // quotaV1Response is the raw response from getAIUsageEligibility
